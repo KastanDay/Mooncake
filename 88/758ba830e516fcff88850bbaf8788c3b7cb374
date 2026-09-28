@@ -1,0 +1,43 @@
+docs/source/design/store/mooncake-store.md
+  s_79cb50fc6aadd5::t_3e5438770aa733 607-611
+mooncake-store/conf/master.json
+  s_79cb50fc6aadd5::t_99841c842f6d54 20-21
+mooncake-store/conf/master.yaml
+  s_79cb50fc6aadd5::t_59264243b1ad72 27-30
+mooncake-store/include/master_config.h
+  s_79cb50fc6aadd5::t_9761adf770bb42 150-156,263-264,328-330,524-525,623-625,750-752,1209-1210,1304-1306
+mooncake-store/include/master_service.h
+  s_79cb50fc6aadd5::t_5151351f554f00 2566-2569
+mooncake-store/include/segment.h
+  s_79cb50fc6aadd5::t_5b737f0708364c 26-33,184-186,340-342
+mooncake-store/include/types.h
+  s_79cb50fc6aadd5::t_de392381129a71 457-470
+mooncake-store/src/master.cpp
+  s_79cb50fc6aadd5::t_197cf8b32ff720 250-258,577-583,980-991,1088-1097
+mooncake-store/src/master_service.cpp
+  s_79cb50fc6aadd5::t_7d9d8c7250d6ef 427-435,443-467,4119-4120,8342
+mooncake-store/src/segment.cpp
+  s_79cb50fc6aadd5::t_f50be9aa5ad798 7-8,56-77,80-81,87-135,147,158-172,196-222,224-225,229-234,681-688
+mooncake-store/tests/dynamic_replication_test.cpp
+  s_79cb50fc6aadd5::t_45cd5a7c5a5c4e 1095-1166
+mooncake-store/tests/master_service_test.cpp
+  s_79cb50fc6aadd5::t_a13914d1686070 20,2508-2576
+mooncake-store/tests/segment_test.cpp
+  s_79cb50fc6aadd5::t_619310568a7787 13,16,19,856-997
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "88758ba830e516fcff88850bbaf8788c3b7cb374",
+  "prompts": {},
+  "sessions": {
+    "s_79cb50fc6aadd5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f16740bddffea3JwqpnNQvsYBz",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
