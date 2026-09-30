@@ -10,7 +10,13 @@ on:
       - "main"
       - "release/**"
     types: [opened, synchronize, reopened, labeled]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'Git comparison base for manual formatting checks'
+        required: false
+        default: 'origin/main'
+        type: string
 
 permissions:
   contents: read
@@ -376,6 +382,8 @@ jobs:
         if [ "${{ github.event_name }}" == "pull_request" ]; then
           # For PRs: compare against the target branch
           BASE_REF="origin/${{ github.base_ref }}"
+        elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          BASE_REF="${DISPATCH_BASE_REF:-origin/main}"
         else
           # For push events: use github.event.before to handle multi-commit pushes
           BEFORE_SHA="${{ github.event.before }}"
@@ -389,6 +397,8 @@ jobs:
         fi
         echo "Comparing against: ${BASE_REF}"
         ./scripts/code_format.sh --check --changed-lines --base "${BASE_REF}"
+      env:
+        DISPATCH_BASE_REF: ${{ inputs.base_ref }}
       shell: bash
 
 
