@@ -275,6 +275,24 @@ class PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_same_node) = 0;
 
+    virtual std::pair<std::vector<int64_t>, std::vector<std::string>>
+    batch_get_into_with_sources(const std::vector<std::string> &keys,
+                                const std::vector<void *> &buffers,
+                                const std::vector<size_t> &sizes) {
+        return {batch_get_into(keys, buffers, sizes),
+                std::vector<std::string>(keys.size(), "unknown")};
+    }
+
+    virtual std::pair<std::vector<int>, std::vector<std::string>>
+    batch_get_into_multi_buffers_with_sources(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &buffers,
+        const std::vector<std::vector<size_t>> &sizes, bool prefer_same_node) {
+        return {batch_get_into_multi_buffers(keys, buffers, sizes,
+                                             prefer_same_node),
+                std::vector<std::string>(keys.size(), "unknown")};
+    }
+
     virtual int put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config = ReplicateConfig{}) = 0;
 

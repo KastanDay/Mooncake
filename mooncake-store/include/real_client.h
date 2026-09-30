@@ -157,6 +157,18 @@ class RealClient : public PyClient {
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
 
+    std::pair<std::vector<int64_t>, std::vector<std::string>>
+    batch_get_into_with_sources(const std::vector<std::string> &keys,
+                                const std::vector<void *> &buffers,
+                                const std::vector<size_t> &sizes) override;
+
+    std::pair<std::vector<int>, std::vector<std::string>>
+    batch_get_into_multi_buffers_with_sources(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &buffers,
+        const std::vector<std::vector<size_t>> &sizes,
+        bool prefer_same_node) override;
+
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
      * keys
@@ -644,14 +656,15 @@ class RealClient : public PyClient {
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
-        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        std::vector<std::string> *sources = nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_same_node, std::vector<std::string> *sources = nullptr);
 
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
