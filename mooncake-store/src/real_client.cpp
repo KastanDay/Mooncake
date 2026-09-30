@@ -5041,10 +5041,36 @@ RealClient::get_into_ranges_shm_helper(
         query_result_cache.empty() ? nullptr : &query_result_cache);
 }
 
+std::pair<std::vector<int64_t>, std::vector<std::string>>
+RealClient::batch_get_into_with_sources(const std::vector<std::string> &keys,
+                                        const std::vector<void *> &buffers,
+                                        const std::vector<size_t> &sizes) {
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<std::string> sources(keys.size(), "unknown");
+    auto internal = batch_get_into_internal(keys, buffers, sizes, &sources);
+    std::vector<int64_t> results;
+    results.reserve(internal.size());
+    for (size_t index = 0; index < internal.size(); ++index) {
+        results.push_back(to_py_ret(internal[index]));
+        if (!internal[index]) sources[index] = "unknown";
+    }
+    if (client_) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started)
+                .count();
+        client_->ObserveTransferOperation(
+            TransferOperationKind::kRead, "batch_get_into",
+            sum_positive_results(results), elapsed);
+    }
+    return {std::move(results), std::move(sources)};
+}
+
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
-                                    const std::vector<size_t> &sizes) {
+                                    const std::vector<size_t> &sizes,
+                                    std::vector<std::string> *sources) {
     [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     // Validate preconditions
     if (!client_) {
@@ -5129,6 +5155,11 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
         // Calculate required buffer size
         const auto replica = *best_replica;
+        if (sources) {
+            (*sources)[i] = replica.is_memory_replica()       ? "memory"
+                            : replica.is_local_disk_replica() ? "local_disk"
+                                                              : "unknown";
+        }
         uint64_t total_size = calculate_total_size(replica);
 
         // Validate buffer capacity
@@ -6115,12 +6146,39 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
     return results;
 }
 
+std::pair<std::vector<int>, std::vector<std::string>>
+RealClient::batch_get_into_multi_buffers_with_sources(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &buffers,
+    const std::vector<std::vector<size_t>> &sizes, bool prefer_same_node) {
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<std::string> sources(keys.size(), "unknown");
+    auto internal = batch_get_into_multi_buffers_internal(
+        keys, buffers, sizes, prefer_same_node, &sources);
+    std::vector<int> results;
+    results.reserve(internal.size());
+    for (size_t index = 0; index < internal.size(); ++index) {
+        results.push_back(to_py_ret(internal[index]));
+        if (!internal[index]) sources[index] = "unknown";
+    }
+    if (client_) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started)
+                .count();
+        client_->ObserveTransferOperation(
+            TransferOperationKind::kRead, "batch_get_into_multi_buffers",
+            sum_positive_results(results), elapsed);
+    }
+    return {std::move(results), std::move(sources)};
+}
+
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node, std::vector<std::string> *sources) {
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -6199,6 +6257,11 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         const auto replica = *best_replica;
+        if (sources) {
+            (*sources)[i] = replica.is_memory_replica()       ? "memory"
+                            : replica.is_local_disk_replica() ? "local_disk"
+                                                              : "unknown";
+        }
         uint64_t total_size = calculate_total_size(replica);
         const auto &sizes = all_sizes[i];
         uint64_t dst_total_size = 0;

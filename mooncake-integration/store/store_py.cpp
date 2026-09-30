@@ -2842,6 +2842,22 @@ PYBIND11_MODULE(store, m) {
             "Get multiple byte ranges from multiple objects into multiple "
             "pre-allocated buffers")
         .def(
+            "batch_get_into_with_sources",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<size_t> &sizes) {
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t pointer : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(pointer));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_into_with_sources(keys, buffers,
+                                                                sizes);
+            },
+            py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"))
+        .def(
             "batch_get_into",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
@@ -3009,6 +3025,19 @@ PYBIND11_MODULE(store, m) {
             "Put object data directly from multiple pre-allocated buffers for "
             "multiple "
             "keys")
+        .def(
+            "batch_get_into_multi_buffers_with_sources",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::vector<uintptr_t>> &buffers,
+               const std::vector<std::vector<size_t>> &sizes,
+               bool prefer_same_node) {
+                py::gil_scoped_release release;
+                return self.store_->batch_get_into_multi_buffers_with_sources(
+                    keys, CastAddrs2Ptrs(buffers), sizes, prefer_same_node);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("prefer_alloc_in_same_node") = false)
         .def(
             "batch_get_into_multi_buffers",
             [](MooncakeStorePyWrapper &self,

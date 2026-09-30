@@ -562,6 +562,47 @@ TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
 // Test Get Operation will fail if the lease has expired.
 // Set the lease time to 1ms and use large data size to ensure the lease will
 // expire.
+TEST_F(RealClientTest, BatchReadReceiptsFollowSuccessfulSelectedReplica) {
+    StartMasterAndSetupClient();
+    const std::string key = "receipt_key";
+    const std::string data = "receipt-data";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(
+                  key, std::span<const char>(data.data(), data.size()), config),
+              0);
+    auto allocation =
+        py_client_->client_buffer_allocator_->allocate(data.size() * 2);
+    ASSERT_TRUE(allocation.has_value());
+    BufferHandle buffer = std::move(*allocation);
+    auto* destination = static_cast<char*>(buffer.ptr());
+    const std::vector<std::string> keys{key, "missing_receipt_key"};
+    const std::vector<void*> pointers{destination, destination + data.size()};
+    const std::vector<size_t> sizes{data.size(), data.size()};
+    auto [results, sources] =
+        py_client_->batch_get_into_with_sources(keys, pointers, sizes);
+    ASSERT_EQ(results.size(), keys.size());
+    ASSERT_EQ(sources.size(), keys.size());
+    EXPECT_EQ(results[0], static_cast<int64_t>(data.size()));
+    EXPECT_LT(results[1], 0);
+    EXPECT_EQ(sources[0], "memory");
+    EXPECT_EQ(sources[1], "unknown");
+    EXPECT_EQ(std::string(destination, data.size()), data);
+    const auto legacy = py_client_->batch_get_into(keys, pointers, sizes);
+    EXPECT_EQ(legacy, results);
+    auto [small_results, small_sources] =
+        py_client_->batch_get_into_with_sources({key}, {destination}, {0});
+    ASSERT_EQ(small_results.size(), 1);
+    EXPECT_LT(small_results[0], 0);
+    EXPECT_EQ(small_sources[0], "unknown");
+    auto [multi_results, multi_sources] =
+        py_client_->batch_get_into_multi_buffers_with_sources(
+            {key}, {{destination}}, {{data.size()}}, false);
+    ASSERT_EQ(multi_results.size(), 1);
+    EXPECT_GT(multi_results[0], 0);
+    EXPECT_EQ(multi_sources[0], "memory");
+}
+
 TEST_F(RealClientTest, GetWithLeaseTimeOut) {
     // Start in-proc master
     const uint64_t kv_lease_ttl_ = 1;
