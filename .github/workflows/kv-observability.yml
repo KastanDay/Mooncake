@@ -1,6 +1,9 @@
 name: KV observability native prerequisites
 
 on:
+  push:
+    branches:
+      - kastan/kv-observability-v1
   workflow_dispatch:
 
 permissions:
