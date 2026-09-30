@@ -413,6 +413,19 @@ MasterMetricManager::MasterMetricManager()
       tenant_evict_bytes_total_(
           "mooncake_tenant_evict_bytes_total",
           "Total bytes evicted by tenant-scoped quota eviction", {"tenant_id"}),
+      replica_eviction_bytes_total_(
+          "master_replica_eviction_logical_bytes_total",
+          "Logical replica bytes removed in observed eviction paths; not "
+          "physical reclamation",
+          {"medium", "disposition"}),
+      eviction_no_servable_metadata_objects_total_(
+          "master_eviction_no_servable_metadata_objects_total",
+          "Observed evictions leaving no completed valid metadata replica; not "
+          "verified physical loss"),
+      eviction_no_servable_metadata_bytes_total_(
+          "master_eviction_no_servable_metadata_logical_bytes_total",
+          "Logical object bytes in observed evictions leaving no completed "
+          "valid metadata replica"),
 
       // Snapshot Metrics
       snapshot_duration_ms_(
@@ -1237,6 +1250,24 @@ void MasterMetricManager::inc_tenant_evict_bytes(const std::string& tenant_id,
     tenant_evict_bytes_total_.inc({tenant_id}, bytes);
 }
 
+void MasterMetricManager::observe_replica_eviction(const std::string& medium,
+                                                   uint64_t bytes,
+                                                   uint64_t object_size,
+                                                   bool servable_remaining) {
+    if (bytes == 0) return;
+    const std::string tier = medium == "cpu"    ? "memory"
+                             : medium == "disk" ? "disk"
+                                                : "unknown";
+    replica_eviction_bytes_total_.inc(
+        {tier, servable_remaining ? "surviving_servable_metadata"
+                                  : "no_servable_metadata"},
+        bytes);
+    if (!servable_remaining) {
+        eviction_no_servable_metadata_objects_total_.inc(1);
+        eviction_no_servable_metadata_bytes_total_.inc(object_size);
+    }
+}
+
 void MasterMetricManager::set_snapshot_duration_ms(int64_t size) {
     snapshot_duration_ms_.observe(size);
 }
@@ -1987,6 +2018,9 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_candidate_dropped_limit_);
     serialize_metric(tenant_quota_reject_total_);
     serialize_metric(tenant_evict_bytes_total_);
+    serialize_metric(replica_eviction_bytes_total_);
+    serialize_metric(eviction_no_servable_metadata_objects_total_);
+    serialize_metric(eviction_no_servable_metadata_bytes_total_);
 
     // Serialize Snapshot Metrics
     serialize_metric(snapshot_duration_ms_);

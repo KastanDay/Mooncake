@@ -7108,10 +7108,12 @@ void MasterService::RunDfsEviction() {
                         return matches_candidate(replica, candidate) &&
                                !replica.is_processing();
                     });
-                if (erased > 0 && !metadata.IsValid()) {
+                if (erased > 0) {
                     PublishKvRemovedAfterEvict(candidate.key,
                                                metadata.size * erased, "disk",
                                                metadata, tenant_id);
+                }
+                if (erased > 0 && !metadata.IsValid()) {
                     EraseMetadata(tenant_state, metadata_it, tenant_id,
                                   QuotaEraseMode::kFull);
                 }
@@ -12889,8 +12891,14 @@ void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
                                                const std::string& medium,
                                                const ObjectMetadata& metadata,
                                                const TenantId& tenant_id) {
-    (void)freed_bytes;
-    (void)medium;
+    const bool servable_remaining =
+        metadata.HasReplica([](const Replica& replica) {
+            return replica.is_completed() &&
+                   (!replica.is_memory_replica() ||
+                    !replica.has_invalid_mem_handle());
+        });
+    MasterMetricManager::instance().observe_replica_eviction(
+        medium, freed_bytes, metadata.size, servable_remaining);
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
