@@ -277,6 +277,9 @@ class MasterMetricManager {
     // total eviction metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
     void inc_eviction_fail();  // not a single object is evicted
+    void observe_replica_eviction(const std::string& medium, uint64_t bytes,
+                                  uint64_t object_size,
+                                  bool servable_remaining);
     // mem eviction metrics
     void inc_mem_eviction_success(int64_t key_count, int64_t size);
     void inc_mem_eviction_fail();  // not a single object is evicted
@@ -723,6 +726,9 @@ class MasterMetricManager {
 
     ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
     ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;
+    ylt::metric::dynamic_counter_2t replica_eviction_bytes_total_;
+    ylt::metric::counter_t eviction_no_servable_metadata_objects_total_;
+    ylt::metric::counter_t eviction_no_servable_metadata_bytes_total_;
 
     // Snapshot Metrics
     ylt::metric::histogram_t snapshot_duration_ms_;

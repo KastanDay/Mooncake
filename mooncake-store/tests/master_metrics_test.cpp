@@ -573,6 +573,20 @@ TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
     admin_server.Stop();
 }
 
+TEST_F(MasterMetricsTest,
+       ReplicaEvictionsKeepSurvivingMetadataSeparateAndLabelsBounded) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.observe_replica_eviction("cpu", 16, 16, true);
+    metrics.observe_replica_eviction("disk", 32, 32, false);
+    metrics.observe_replica_eviction("unexpected-label", 64, 64, true);
+    const auto text = metrics.serialize_metrics();
+    EXPECT_NE(text.find("surviving_servable_metadata"), std::string::npos);
+    EXPECT_NE(text.find("no_servable_metadata"), std::string::npos);
+    EXPECT_NE(text.find("master_eviction_no_servable_metadata_objects_total"),
+              std::string::npos);
+    EXPECT_EQ(text.find("unexpected-label"), std::string::npos);
+}
+
 TEST_F(MasterMetricsTest, ProjectStorageUsageRemovesAbsentSegmentLabels) {
     auto& metrics = MasterMetricManager::instance();
     const std::string mem_segment = "projected_removed_mem_segment";
