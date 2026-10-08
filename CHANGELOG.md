@@ -6,6 +6,172 @@ python.cfdata.org. Newest first. Each entry is a GitLab release tagged
 `wheel-<version>` on the wheels' source commit; the version is the build's UTC
 start time, `YY.MDD.HMMSS`.
 
+## wheel-26.1008.202747 (2026-10-08)
+
+Master: keep client liveness independent of metadata cleanup.
+
+On eu-west1 (2026-10-08, about 13.8M keys), one elastic Store's disk unmount
+flushed the whole cache:
+
+1. `UnmountLocalDiskSegment` walked every metadata shard inside its RPC handler
+   for 58 s. Synchronous coro_rpc handlers run on their connection's IO thread,
+   so that walk held the thread and starved every connection sharing it.
+2. A client on that thread missed its Pings and expired.
+3. Its expiry swept the whole index again on the client-monitor thread, holding
+   `snapshot_mutex_` shared throughout.
+4. The expired, still-alive client remounted. `ReMountSegment` took
+   `client_mutex_` exclusively and then waited for `snapshot_mutex_`.
+5. Every Ping, and every Put/Upsert/batch call, needed `client_mutex_` shared,
+   so they all waited behind that remount and all 75 clients expired at once.
+6. The mass expiry then erased all 13.8M keys while holding shard locks, for
+   about 2 minutes.
+
+The defect was that liveness depended on O(total keys) metadata cleanup, run
+inline on threads and under locks that liveness also needed. At 1 PiB of SSD
+(0.5 to 1 billion keys), one Store crash would have frozen the Master for tens
+of minutes.
+
+The change is Master only: no client, protocol or flag change, and the 10-s
+client TTL stays. Three mechanisms:
+
+- **Pings never wait.**
+  - `Ping` records receipt in a liveness table under a leaf mutex. Nothing
+    holds that mutex while waiting for another lock.
+  - The table is the only record of a client's status; `ok_client_` is gone.
+  - The monitor reads the table and revalidates each expiry under the locks:
+    a client that pinged since it was selected stays.
+  - Lock order is `snapshot_mutex_`, then `client_mutex_`, then the leaf.
+    Remount takes the snapshot lock first, so nothing holds `client_mutex_`
+    while it waits. The data paths no longer take `client_mutex_` at all.
+- **A replica's validity is checked in O(1) when it is read, and is
+  monotone.**
+  - Each LOCAL_DISK replica is bound to the disk-registration generation it
+    was admitted under. It is servable only while that generation is current.
+  - Generations are never reused, and 0 (bound to none) is never current. So
+    once a replica is invalid it stays invalid: a later registration under
+    the same client id cannot resurrect it.
+  - A snapshot restore binds each restored replica to its owner's restored
+    registration and credits its bytes there, as a live admission does.
+  - An owner that reports a key again under a new registration rebinds its
+    completed replica in place (HA keeps the old replica until its removal is
+    durable; one already marked for removal is left to go).
+  - A promoted HA standby has no SSD registry to bind against, so its disk
+    replicas serve nothing until each owner re-registers and rescans. That is
+    the price of monotonicity, in a mode eu-west1 does not run.
+  - Used bytes are credited and debited per registration.
+- **Cleanup is background garbage collection.**
+  - Disk unmount and client expiry retire the registration or segment in
+    O(that client's segments) and schedule the coalescing cleanup worker.
+    Every expiry schedules one.
+  - The worker visits at most about 256 keys per lock hold, taking
+    `snapshot_mutex_` shared and one shard lock per batch.
+  - It resumes from a bucket cursor and restarts a tenant if its map was
+    rehashed, which is rare.
+  - It steps aside whenever an exclusive writer, such as a remount or a disk
+    unmount, is waiting.
+  - HA, snapshot and CXL modes keep their synchronous sweeps, with the same
+    predicate.
+
+- **No RPC handler does unbounded eviction, and no long pass holds the
+  snapshot lock.** A live A/B on eu-west1 (23M keys, 76 clients) found the
+  same failure through a second path:
+  - After a capacity drop, a tenant's quota collapses below what it holds.
+    Its next Put evicted the whole shortfall inline, on its RPC IO thread:
+    519k objects over 33 s.
+  - `BatchEvict` held `snapshot_mutex_` shared for its whole run, so remounts
+    and disk mounts waited out the run on their IO threads.
+  - Crashing all three test Stores at once expired all 76 clients.
+
+  Now:
+  - A write's inline eviction examines at most 4,096 keys. If that is not
+    enough, the write is refused (`quota_trimming`) and its demand goes to a
+    background quota-trim worker. The worker also trims every tenant down to
+    its quota whenever capacity or a policy changes.
+  - `BatchEvict`, the quota eviction and the cleanup pass take the snapshot
+    lock per shard section, and step aside while a writer waits. HA, snapshot
+    and CXL modes keep their whole-run holds, so a snapshot never lands
+    mid-eviction there.
+  - Tenants without an explicit policy (orphan state) are never trimmed, as
+    before.
+  - A slow inline eviction logs `inline_quota_eviction_slow`.
+
+Also:
+- Only a servable disk replica counts as an eviction backup or a promotion
+  source, and a promotion task reaches only its registration's mailbox.
+- Admission re-checks the generation under the shard lock, so a replica racing
+  a retirement is refused rather than published behind the cleanup pass.
+- The cleanup plan builds surviving descriptors only when the HA oplog needs
+  them, and the `get_descriptor` error is rate-limited (27,432 lines in one
+  minute during the incident, under shard locks).
+
+Reviews:
+- a critical design review and two implementation reviews by Codex
+  (GPT-6-astra);
+- a design review and implementation audit by Claude (Fable 5.1). Its
+  simplifications went in: monotone generations replace a special sweep for
+  restored replicas, and there is one record of client status.
+
+Tests: new `master_liveness_isolation_test` (24 tests and a benchmark). It
+covers each link of the incident chain, and these regressions:
+- re-registration and restore;
+- admission racing retirement;
+- eviction and promotion against ended registrations;
+- the offload-disabled path;
+- rehash and yield in the cleanup pass.
+Each test fails without the change it covers.
+
+The existing Master suites pass. Three tests encoded the old semantics and
+were adapted:
+- one expected a never-remounted owner's disk replica to be stale;
+- one called the removed owner-targeted sweep;
+- the manager tests now name the registration they credit.
+
+What this does not fix: handlers still run on the RPC IO threads that also
+carry Pings. Every known long hold is now bounded, but a new unbounded handler
+would starve its thread's clients again. `GetReplicaListByRegex`,
+`RemoveByRegex` and `RemoveAll` still scan the whole index inline; do not call
+them on a large index.
+
+Deferred, as gates before the index grows well past today's:
+- moving blocking handlers off the IO threads (defence in depth);
+- an owner-to-replica index, so reclamation is targeted (today a pass costs
+  about 10 s at 14M keys and grows linearly);
+- a lock-free published generation map for the read path;
+- reclaiming a hot key's dead disk replica when it is accessed;
+- parallel quota trimming across shards, if a trim after a large capacity drop takes minutes;
+- recoverable client suspicion.
+
+### Artifacts
+
+Version `26.1008.202747` (built 2026-10-08 20:27:47 UTC) from `7a5f072e6913c7643c8723e41aa0a8fcb1fdd0bb` on `kastan/wheel`.
+Builder images: non-cuda: `pytorch/manylinux2_28-builder:cuda12.8`. CPython 3.12, x86_64.
+
+| Variant | File | sha256 | Registry |
+|---|---|---|---|
+| non-cuda | `mooncake_transfer_engine_non_cuda-26.1008.202747-cp312-cp312-manylinux_2_28_x86_64.whl` | `fd596b3db3d3953f816887eee71abe1d55c5b8008623f3a221b0a2ae90cc15cf` | [https://python.cfdata.org/project/mooncake-transfer-engine-non-cuda/files/…](https://python.cfdata.org/project/mooncake-transfer-engine-non-cuda/files/mooncake_transfer_engine_non_cuda-26.1008.202747-cp312-cp312-manylinux_2_28_x86_64.whl) |
+
+Pin (mooncake-helm `mooncake-shared-cache` values; pods get `PYTHON_REGISTRY` from
+the `cf-python-registry` Secret):
+
+```yaml
+  master.package: "${PYTHON_REGISTRY}/project/mooncake-transfer-engine-non-cuda/files/mooncake_transfer_engine_non_cuda-26.1008.202747-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=fd596b3db3d3953f816887eee71abe1d55c5b8008623f3a221b0a2ae90cc15cf"
+```
+
+### Commits since v0.3.13.post1
+
+- `431e70ef` [Store] Unregister a segment's memory when its mount fails (Kastan Day)
+- `57d1b314` Add additive successful-read source receipts to Store clients (Kastan Day)
+- `598eeac7` Distinguish observed replica eviction from surviving servable metadata (Kastan Day)
+- `1f4ce545` Record wheel-26.1006.215531 in the changelog (Kastan Day)
+- `5c120b67` [Store] Keep Master client liveness independent of metadata cleanup (Kastan Day)
+- `28edeb72` [Store] Close the gaps an implementation review found (Kastan Day)
+- `7d7cd076` [Store] Fence promotion enqueue and expiry's deadline cleanup (Kastan Day)
+- `ad44146a` Record wheel-26.1008.43949 in the changelog (Kastan Day)
+- `294ed5a4` [Store] Make disk-replica validity monotone; one record of client status (Kastan Day)
+- `8f86e3ea` [Store] Rebind only a completed disk replica on re-adoption (Kastan Day)
+- `5644d1f9` Record wheel-26.1008.65205 in the changelog (Kastan Day)
+- `7a5f072e` [Store] Bound inline quota eviction; no eviction pass holds the snapshot lock (Kastan Day)
+
 ## wheel-26.1008.65205 (2026-10-08)
 
 Master: keep client liveness independent of metadata cleanup.
