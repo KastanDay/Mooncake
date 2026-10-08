@@ -1007,13 +1007,19 @@ class MasterService {
     // and nothing it waits on is held across the pass. Callers that already
     // hold snapshot_mutex_ (the synchronous, HA/snapshot paths) pass
     // lock_snapshot_per_batch=false.
-    void ClearInvalidHandles(bool lock_snapshot_per_batch = true);
+    // retired_owners: owners retired just now, on the synchronous paths
+    // (HA, snapshot, CXL), whose restored (generation 0) LOCAL_DISK replicas
+    // must go too.
+    void ClearInvalidHandles(
+        bool lock_snapshot_per_batch = true,
+        const std::unordered_set<UUID, boost::hash<UUID>>& retired_owners = {});
     // Shard walk behind it; removes completed replicas matching is_stale,
     // erasing a key when no valid replica remains. Visits at most
     // kStaleHandleBatchKeys keys per shard-lock hold.
     void ClearStaleHandles(const std::function<bool(const Replica&)>& is_stale,
                            bool lock_snapshot_per_batch);
     static constexpr size_t kStaleHandleBatchKeys = 256;
+    static constexpr size_t kStaleHandleBatchBuckets = 4096;
 
     // A replica no reader may be given any more, whose metadata is garbage:
     // completed, and on an unmounted memory or NoF segment, or on a LOCAL_DISK
@@ -1024,10 +1030,6 @@ class MasterService {
     // Whether a LOCAL_DISK replica's registration is still current (true for
     // any other replica type).
     bool IsLocalDiskRegistrationCurrent(const Replica& replica) const;
-    // Schedules replica_cleanup_worker_ when segments may be reclaimed in the
-    // background, otherwise sweeps now (the caller must not hold
-    // snapshot_mutex_ then).
-    void RequestStaleHandleCleanup();
     // Takes snapshot_mutex_ exclusively, announcing the wait so the cleanup
     // pass steps aside between batches rather than starving the writer.
     std::unique_lock<std::shared_mutex> LockSnapshotExclusive() const;
@@ -2895,6 +2897,11 @@ class MasterService {
 
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
+    // A completed LOCAL_DISK replica whose registration is current: the only
+    // kind that may be served, promoted from, or counted as an eviction
+    // backup.
+    bool IsServableLocalDiskReplica(const Replica& replica) const;
+    bool HasServableLocalDiskReplica(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**

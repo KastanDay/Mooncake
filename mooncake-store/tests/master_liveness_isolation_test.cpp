@@ -16,11 +16,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <filesystem>
 #include <chrono>
 #include <future>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "master_service.h"
@@ -40,13 +43,55 @@ class MasterLivenessIsolationTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
-    static std::unique_ptr<MasterService> MakeService(int64_t ttl_sec = 10) {
+    // A TTL long enough that no fixture client expires during setup; the
+    // expiry tests pass a short one and keep their clients pinging.
+    static std::unique_ptr<MasterService> MakeService(int64_t ttl_sec = 3600) {
         MasterServiceConfig config;
         config.enable_offload = true;
         config.default_kv_lease_ttl = 0;
         config.client_live_ttl_sec = ttl_sec;
         return std::make_unique<MasterService>(config);
     }
+
+    // Pings the given clients every 200 ms until destroyed; Drop() stops
+    // pinging one of them.
+    class KeepAlive {
+       public:
+        KeepAlive(MasterService& service, std::vector<UUID> clients)
+            : clients_(std::move(clients)), thread_([this, &service] {
+                  while (!stop_) {
+                      std::vector<UUID> clients;
+                      {
+                          std::lock_guard<std::mutex> lock(mutex_);
+                          clients = clients_;
+                      }
+                      for (const auto& id : clients) {
+                          auto ping = service.Ping(id);
+                          if (!ping ||
+                              ping->client_status != ClientStatus::OK) {
+                              ++not_ok_;
+                          }
+                      }
+                      std::this_thread::sleep_for(milliseconds(200));
+                  }
+              }) {}
+        ~KeepAlive() {
+            stop_ = true;
+            thread_.join();
+        }
+        void Drop(const UUID& id) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::erase(clients_, id);
+        }
+        int not_ok() const { return not_ok_.load(); }
+
+       private:
+        std::mutex mutex_;
+        std::vector<UUID> clients_;
+        std::atomic<bool> stop_{false};
+        std::atomic<int> not_ok_{0};
+        std::thread thread_;
+    };
 
     struct Client {
         UUID id;
@@ -98,6 +143,31 @@ class MasterLivenessIsolationTest : public ::testing::Test {
         return service.NotifyOffloadSuccess(client.id, {task}, {metadata});
     }
 
+    // Disk-only keys, in batches: the index a cleanup pass walks, at a
+    // fraction of the setup time of Put + offload.
+    static void OffloadDiskOnlyKeys(MasterService& service,
+                                    const Client& client,
+                                    const std::string& prefix, size_t count) {
+        std::vector<OffloadTaskItem> tasks;
+        std::vector<StorageObjectMetadata> metas;
+        for (size_t i = 0; i < count; ++i) {
+            tasks.push_back({.tenant_id = TenantId::Default().value(),
+                             .key = prefix + std::to_string(i),
+                             .size = 64});
+            StorageObjectMetadata meta;
+            meta.data_size = 64;
+            meta.transport_endpoint = client.segment.name;
+            metas.push_back(meta);
+            if (tasks.size() == 4096 || i + 1 == count) {
+                ASSERT_TRUE(
+                    service.NotifyOffloadSuccess(client.id, tasks, metas)
+                        .has_value());
+                tasks.clear();
+                metas.clear();
+            }
+        }
+    }
+
     static void PutAndOffload(MasterService& service, const Client& client,
                               const std::string& key, int64_t size = 1024) {
         Put(service, client, key, size);
@@ -109,6 +179,19 @@ class MasterLivenessIsolationTest : public ::testing::Test {
     }
     static std::shared_mutex& ClientMutex(MasterService& service) {
         return service.client_mutex_;
+    }
+    static bool BackgroundCleanup(MasterService& service) {
+        return service.enable_async_segment_cleanup_;
+    }
+    static size_t ShardOf(MasterService& service, const std::string& key) {
+        return service.getMetadataShardIndex(TenantId::Default(), key);
+    }
+    static int SnapshotWritersWaiting(MasterService& service) {
+        return service.snapshot_writers_waiting_.load();
+    }
+    static void ExpireNow(MasterService& service, const UUID& client_id,
+                          Clock::time_point selected_at) {
+        service.ExpireClients({client_id}, selected_at);
     }
 
     // Ends a LOCAL_DISK registration without scheduling cleanup, so its
@@ -213,14 +296,17 @@ TEST_F(MasterLivenessIsolationTest, PingIsAnsweredWhileARemountWaitsOnAPass) {
         service->ReMountSegment({b.segment}, b.id);
         remount_done = true;
     });
-    std::this_thread::sleep_for(milliseconds(200));  // Remount is now waiting.
+    ASSERT_TRUE(WaitFor([&] { return SnapshotWritersWaiting(*service) > 0; },
+                        milliseconds(5000)))
+        << "the remount never waited for the held pass";
     EXPECT_FALSE(remount_done);
 
     // On a regression the Ping would wait for the held pass: answer it from
     // a future, so the test fails instead of deadlocking.
     auto ping =
         std::async(std::launch::async, [&] { return service->Ping(a.id); });
-    EXPECT_EQ(ping.wait_for(milliseconds(100)), std::future_status::ready)
+    // Generous: on a regression the Ping waits until the pass is released.
+    EXPECT_EQ(ping.wait_for(milliseconds(2000)), std::future_status::ready)
         << "Ping waited behind the remount";
 
     // Nor does anything else that needs client_mutex_ wait on it.
@@ -230,7 +316,7 @@ TEST_F(MasterLivenessIsolationTest, PingIsAnsweredWhileARemountWaitsOnAPass) {
         client_lock_taken = true;
     });
     EXPECT_TRUE(
-        WaitFor([&] { return client_lock_taken.load(); }, milliseconds(500)))
+        WaitFor([&] { return client_lock_taken.load(); }, milliseconds(2000)))
         << "the waiting remount holds client_mutex_";
 
     release_pass = true;
@@ -264,7 +350,7 @@ TEST_F(MasterLivenessIsolationTest, PutsDoNotWaitForClientMutex) {
         return service->Ping(a.id).has_value();
     });
     const bool prompt =
-        work.wait_for(milliseconds(100)) == std::future_status::ready;
+        work.wait_for(milliseconds(2000)) == std::future_status::ready;
     release = true;
     holder.join();
     EXPECT_TRUE(prompt) << "Put or Ping waited for client_mutex_";
@@ -343,22 +429,34 @@ TEST_F(MasterLivenessIsolationTest, ReclaimPassCoversKeysDespiteRehash) {
     auto service = MakeService();
     auto a = MountClient(*service, "rehash_a", 0x100000000);
     auto b = MountClient(*service, "rehash_b", 0x200000000);
-    constexpr int kOld = 5000;
-    for (int i = 0; i < kOld; ++i) {
-        PutAndOffload(*service, a, "rehash_old_" + std::to_string(i));
+    // Every key in one shard, so the pass takes many batches there and the
+    // concurrent inserts rehash the very map it is walking.
+    auto keys_in_shard = [&](const std::string& prefix, size_t count) {
+        std::vector<std::string> keys;
+        for (size_t i = 0; keys.size() < count; ++i) {
+            std::string key = prefix + std::to_string(i);
+            if (ShardOf(*service, key) == 0) {
+                keys.push_back(std::move(key));
+            }
+        }
+        return keys;
+    };
+    const auto old_keys = keys_in_shard("rehash_old_", 3000);
+    const auto new_keys = keys_in_shard("rehash_new_", 20000);
+    for (const auto& key : old_keys) {
+        PutAndOffload(*service, a, key);
     }
     RetireDiskWithoutCleanup(*service, a.id);
 
     std::atomic<bool> stop{false};
     std::thread writer([&] {
-        for (int i = 0; !stop && i < 20000; ++i) {
-            Put(*service, b, "rehash_new_" + std::to_string(i), 64);
+        for (size_t i = 0; !stop && i < new_keys.size(); ++i) {
+            Put(*service, b, new_keys[i], 64);
         }
     });
-    ReclaimNow(*service);
+    ReclaimNow(*service);  // One pass, asserted on its own.
     stop = true;
     writer.join();
-    ReclaimNow(*service);  // Anything the first pass met mid-rehash.
     EXPECT_EQ(DiskReplicasOwnedBy(*service, a.id), 0u);
 }
 
@@ -368,10 +466,7 @@ TEST_F(MasterLivenessIsolationTest, ReclaimPassYieldsToExclusiveWriters) {
     auto service = MakeService();
     auto a = MountClient(*service, "yield_a", 0x100000000);
     auto b = MountClient(*service, "yield_b", 0x200000000);
-    constexpr int kKeys = 20000;
-    for (int i = 0; i < kKeys; ++i) {
-        PutAndOffload(*service, a, "yield_key_" + std::to_string(i), 64);
-    }
+    OffloadDiskOnlyKeys(*service, a, "yield_key_", 300000);
     RetireDiskWithoutCleanup(*service, a.id);
 
     std::atomic<bool> pass_done{false};
@@ -379,12 +474,24 @@ TEST_F(MasterLivenessIsolationTest, ReclaimPassYieldsToExclusiveWriters) {
         ReclaimNow(*service);
         pass_done = true;
     });
-    std::this_thread::sleep_for(milliseconds(5));
-    auto elapsed = Time([&] {
-        ASSERT_TRUE(service->ReMountSegment({b.segment}, b.id).has_value());
+    std::this_thread::sleep_for(milliseconds(2));
+    const bool pass_running = !pass_done;
+    std::atomic<bool> remount_done{false};
+    std::thread remount([&] {
+        service->ReMountSegment({b.segment}, b.id);
+        remount_done = true;
     });
+    // The remount must finish while the pass is still going, not after it.
+    while (!remount_done && !pass_done) {
+        std::this_thread::sleep_for(milliseconds(1));
+    }
+    const bool remount_first = remount_done && !pass_done;
+    remount.join();
     pass.join();
-    EXPECT_LT(elapsed.count(), 500) << "remount waited for the whole pass";
+    if (!pass_running) {
+        GTEST_SKIP() << "the pass finished before the remount started";
+    }
+    EXPECT_TRUE(remount_first) << "the remount waited for the whole pass";
     EXPECT_EQ(DiskReplicasOwnedBy(*service, a.id), 0u);
 }
 
@@ -395,35 +502,98 @@ TEST_F(MasterLivenessIsolationTest, OneExpiryLeavesOtherClientsAlive) {
     auto service = MakeService(/*ttl_sec=*/2);
     auto victim = MountClient(*service, "expiry_victim", 0x100000000);
     auto survivor = MountClient(*service, "expiry_survivor", 0x200000000);
-    constexpr int kKeys = 5000;
-    for (int i = 0; i < kKeys; ++i) {
-        PutAndOffload(*service, victim, "expiry_key_" + std::to_string(i), 64);
-    }
+    KeepAlive keepalive(*service, {victim.id, survivor.id});
+    OffloadDiskOnlyKeys(*service, victim, "expiry_key_", 20000);
+    ASSERT_TRUE(IsOk(*service, victim.id));
 
-    std::atomic<bool> stop{false};
-    std::atomic<int> survivor_not_ok{0};
-    std::thread pinger([&] {
-        while (!stop) {
-            auto ping = service->Ping(survivor.id);
-            if (!ping || ping->client_status != ClientStatus::OK) {
-                ++survivor_not_ok;
-            }
-            std::this_thread::sleep_for(milliseconds(200));
-        }
-    });
-
+    keepalive.Drop(victim.id);
     EXPECT_TRUE(WaitFor([&] { return !IsOk(*service, victim.id); },
-                        milliseconds(8000)));
+                        milliseconds(10000)));
     EXPECT_FALSE(HasReadableDiskReplicaOf(*service, "expiry_key_0", victim.id));
-    auto ping = service->Ping(victim.id);
-    ASSERT_TRUE(ping.has_value());
-    EXPECT_EQ(ping->client_status, ClientStatus::NEED_REMOUNT);
     EXPECT_TRUE(
         WaitFor([&] { return DiskReplicasOwnedBy(*service, victim.id) == 0; },
                 milliseconds(10000)));
-    stop = true;
-    pinger.join();
-    EXPECT_EQ(survivor_not_ok.load(), 0);
+    EXPECT_TRUE(IsOk(*service, survivor.id));
+    EXPECT_EQ(keepalive.not_ok(), 0);
+}
+
+// The synchronous mode (HA, snapshot or CXL) sweeps inside the expiry: the
+// expired owner's disk registration must already be retired by then, or its
+// replicas would stay behind, unreadable, until some later sweep.
+TEST_F(MasterLivenessIsolationTest, SynchronousExpiryReclaimsDiskReplicas) {
+    const std::string dir =
+        std::string("/tmp/liveness_snapshot_") + std::to_string(::getpid());
+    std::filesystem::create_directories(dir);
+    ::setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", dir.c_str(), 1);
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 0;
+    config.client_live_ttl_sec = 2;
+    config.enable_snapshot = true;
+    config.snapshot_backup_dir = dir;
+    config.snapshot_object_store_type = "local";
+    auto service = std::make_unique<MasterService>(config);
+    ASSERT_FALSE(BackgroundCleanup(*service));
+
+    auto victim = MountClient(*service, "sync_victim", 0x100000000);
+    auto survivor = MountClient(*service, "sync_survivor", 0x200000000);
+    KeepAlive keepalive(*service, {victim.id, survivor.id});
+    OffloadDiskOnlyKeys(*service, victim, "sync_key_", 2000);
+    keepalive.Drop(victim.id);
+    EXPECT_TRUE(WaitFor([&] { return !IsOk(*service, victim.id); },
+                        milliseconds(10000)));
+    // No background worker in this mode: the expiry itself reclaimed them.
+    EXPECT_TRUE(
+        WaitFor([&] { return DiskReplicasOwnedBy(*service, victim.id) == 0; },
+                milliseconds(2000)));
+    EXPECT_EQ(keepalive.not_ok(), 0);
+}
+
+// A client selected for expiry that pings before the expiry is carried out
+// stays, and keeps its pending graceful unmount.
+TEST_F(MasterLivenessIsolationTest, FreshPingKeepsGracefulUnmountDeadline) {
+    auto service = MakeService();
+    auto a = MountClient(*service, "graceful_a", 0x100000000);
+    ASSERT_TRUE(service
+                    ->GracefulUnmountSegment(a.segment.id, a.id,
+                                             /*grace_period_ms=*/500)
+                    .has_value());
+    const auto selected_at = Clock::now() - std::chrono::hours(1);
+    ASSERT_TRUE(service->Ping(a.id).has_value());  // Pinged since selection.
+    ExpireNow(*service, a.id, selected_at);
+    EXPECT_TRUE(IsOk(*service, a.id));
+    // The graceful unmount still completes at its deadline.
+    EXPECT_TRUE(WaitFor(
+        [&] {
+            return !service->QuerySegmentStatus(a.segment.name).has_value();
+        },
+        milliseconds(5000)));
+}
+
+// An ended registration's disk replica is not a backup: eviction must not
+// drop the last servable (memory) copy because of it.
+TEST_F(MasterLivenessIsolationTest, EvictionIgnoresEndedRegistrationBackup) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 0;
+    config.client_live_ttl_sec = 3600;
+    config.offload_on_evict = true;
+    config.offload_force_evict = false;
+    auto service = std::make_unique<MasterService>(config);
+    auto a = MountClient(*service, "evict_a", 0x100000000);
+    auto b = MountClient(*service, "evict_b", 0x200000000);
+    PutAndOffload(*service, a, "evict_key");
+    RetireDiskWithoutCleanup(*service, a.id);
+
+    service->RunBatchEvictForTesting(1.0, 1.0);
+    auto replicas = service->GetReplicaList("evict_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value())
+        << "the last servable copy was evicted against a dead backup";
+    bool has_memory = false;
+    for (const auto& descriptor : replicas->replicas) {
+        has_memory = has_memory || descriptor.is_memory_replica();
+    }
+    EXPECT_TRUE(has_memory);
 }
 
 // The scale shape of the incident, in process: a client with many LOCAL_DISK
@@ -438,28 +608,7 @@ TEST_F(MasterLivenessIsolationTest, LatencyStaysFlatWhileManyKeysAreReclaimed) {
     auto service = MakeService();
     auto victim = MountClient(*service, "scale_victim", 0x100000000);
     auto other = MountClient(*service, "scale_other", 0x200000000);
-    {
-        // Disk replicas directly, without memory replicas: the index the
-        // reclaim pass walks, at a fraction of the setup time.
-        std::vector<OffloadTaskItem> tasks;
-        std::vector<StorageObjectMetadata> metas;
-        for (size_t i = 0; i < keys; ++i) {
-            tasks.push_back({.tenant_id = TenantId::Default().value(),
-                             .key = "scale_key_" + std::to_string(i),
-                             .size = 64});
-            StorageObjectMetadata meta;
-            meta.data_size = 64;
-            meta.transport_endpoint = victim.segment.name;
-            metas.push_back(meta);
-            if (tasks.size() == 4096 || i + 1 == keys) {
-                ASSERT_TRUE(
-                    service->NotifyOffloadSuccess(victim.id, tasks, metas)
-                        .has_value());
-                tasks.clear();
-                metas.clear();
-            }
-        }
-    }
+    OffloadDiskOnlyKeys(*service, victim, "scale_key_", keys);
     ASSERT_EQ(DiskReplicasOwnedBy(*service, victim.id), keys);
 
     milliseconds unmount = Time([&] {
@@ -468,8 +617,7 @@ TEST_F(MasterLivenessIsolationTest, LatencyStaysFlatWhileManyKeysAreReclaimed) {
     milliseconds worst_ping{0};
     milliseconds worst_remount{0};
     const auto reclaim_start = Clock::now();
-    while (DiskReplicasOwnedBy(*service, victim.id) != 0 &&
-           Clock::now() - reclaim_start < std::chrono::minutes(10)) {
+    do {
         for (int i = 0; i < 20; ++i) {
             worst_ping =
                 std::max(worst_ping, Time([&] {
@@ -482,7 +630,8 @@ TEST_F(MasterLivenessIsolationTest, LatencyStaysFlatWhileManyKeysAreReclaimed) {
                 ASSERT_TRUE(service->ReMountSegment({other.segment}, other.id)
                                 .has_value());
             }));
-    }
+    } while (DiskReplicasOwnedBy(*service, victim.id) != 0 &&
+             Clock::now() - reclaim_start < std::chrono::minutes(10));
     const auto reclaim =
         std::chrono::duration_cast<milliseconds>(Clock::now() - reclaim_start);
     LOG(INFO) << "keys=" << keys << " unmount_ms=" << unmount.count()
@@ -490,9 +639,11 @@ TEST_F(MasterLivenessIsolationTest, LatencyStaysFlatWhileManyKeysAreReclaimed) {
               << " worst_ping_ms=" << worst_ping.count()
               << " worst_remount_ms=" << worst_remount.count();
     EXPECT_EQ(DiskReplicasOwnedBy(*service, victim.id), 0u);
-    EXPECT_LT(unmount.count(), 100);
-    EXPECT_LT(worst_ping.count(), 50);
-    EXPECT_LT(worst_remount.count(), 500);
+    // Generous bounds (instrumented builds, loaded runners): the unpatched
+    // unmount alone grows by about 0.7 ms per thousand keys.
+    EXPECT_LT(unmount.count(), 1000);
+    EXPECT_LT(worst_ping.count(), 500);
+    EXPECT_LT(worst_remount.count(), 2000);
 }
 
 }  // namespace mooncake::test

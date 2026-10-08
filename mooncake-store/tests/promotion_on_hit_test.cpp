@@ -34,6 +34,17 @@ size_t CountPromotionTask(const std::vector<PromotionTaskItem>& tasks,
 
 class PromotionOnHitTest : public ::testing::Test {
    protected:
+    // Ends a LOCAL_DISK registration and registers the same client again,
+    // without the cleanup pass: its old replicas stay as garbage.
+    static void ReregisterLocalDisk(MasterService& service,
+                                    const UUID& client_id) {
+        {
+            auto lock = service.LockSnapshotExclusive();
+            service.local_ssd_manager_.UnregisterClient(client_id);
+        }
+        ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true).has_value());
+    }
+
     void SetUp() override {
         google::InitGoogleLogging("PromotionOnHitTest");
         FLAGS_logtostderr = true;
@@ -494,6 +505,32 @@ TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
     auto pending = service->PromotionObjectHeartbeat(unknown_client);
     ASSERT_FALSE(pending.has_value());
     EXPECT_EQ(pending.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+// A promotion admitted from a LOCAL_DISK replica cannot start once that
+// replica's registration has ended, even if its holder registered again
+// under the same id: the new registration never adopted the file.
+TEST_F(PromotionOnHitTest, AllocStartRefusesSourceOfEndedRegistration) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto holder = PrepareSegment(*service, "seg_ended_registration",
+                                 kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_ended",
+                                       1024, holder.segment_name));
+    ASSERT_TRUE(
+        service->GetReplicaList("k_ended", TenantId::Default()).has_value());
+
+    ReregisterLocalDisk(*service, holder.client_id);
+    auto alloc = service->PromotionAllocStart(holder.client_id, "k_ended",
+                                              TenantId::Default(), 1024, {});
+    ASSERT_FALSE(alloc.has_value());
+    EXPECT_EQ(alloc.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    service->RemoveAll(/*force=*/true);
 }
 
 // PromotionAllocStart on a non-existent key returns OBJECT_NOT_FOUND.
