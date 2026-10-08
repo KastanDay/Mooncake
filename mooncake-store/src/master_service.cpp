@@ -1501,6 +1501,20 @@ void MasterService::ScheduleQuotaTrimIfOver() {
 
 bool MasterService::MakeRoomForWrite(const TenantId& tenant_id,
                                      uint64_t deficit_bytes) {
+    // Already far over (a capacity drop or a lowered quota): the trim is
+    // due, and an inline scan would only spend this RPC's IO thread before
+    // refusing anyway.
+    const auto tenant = tenant_quota_table_.GetTenantSnapshot(tenant_id);
+    if (tenant && tenant->charged_bytes > tenant->effective_quota_bytes +
+                                              kInlineQuotaOverageBytes) {
+        {
+            std::lock_guard<std::mutex> lock(quota_trim_demand_mutex_);
+            auto& demand = quota_trim_demand_[tenant_id];
+            demand = std::max(demand, deficit_bytes);
+        }
+        quota_trim_worker_.Schedule();
+        return false;
+    }
     const auto started = std::chrono::steady_clock::now();
     const auto result = EvictTenantMemoryForQuota(tenant_id, deficit_bytes,
                                                   kInlineEvictionKeyBudget);
@@ -10244,24 +10258,28 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 total.freed_bytes,
                 static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))));
     }
+    // Every write's inline eviction can log these: every 1000th is enough
+    // (on eu-west1 they ran at about 1,800 lines/s from the RPC threads).
     if (offload_on_evict_ && total.freed_bytes == 0 &&
         offload_deferred_count > 0) {
-        LOG(WARNING) << "[TENANT-EVICT] No memory freed for tenant "
-                     << normalized_tenant << "; " << offload_deferred_count
-                     << " object(s) deferred for disk offload.";
+        LOG_EVERY_N(WARNING, 1000)
+            << "[TENANT-EVICT] No memory freed for tenant " << normalized_tenant
+            << "; " << offload_deferred_count
+            << " object(s) deferred for disk offload.";
     }
     if (offload_cap_forced_count > 0) {
-        LOG(WARNING) << "[TENANT-EVICT] Offload cap (" << offload_cap
-                     << ") reached for tenant " << normalized_tenant
-                     << "; force-evicted " << offload_cap_forced_count
-                     << " object(s) without disk offload.";
+        LOG_EVERY_N(WARNING, 1000)
+            << "[TENANT-EVICT] Offload cap (" << offload_cap
+            << ") reached for tenant " << normalized_tenant
+            << "; force-evicted " << offload_cap_forced_count
+            << " object(s) without disk offload.";
     }
     if (offload_push_failed_forced > 0) {
-        LOG(WARNING) << "[TENANT-EVICT] PushOffloadingQueue failed for tenant "
-                     << normalized_tenant << " on "
-                     << offload_push_failed_forced
-                     << " object(s); force-evicted without disk offload "
-                        "(offload_force_evict=true).";
+        LOG_EVERY_N(WARNING, 1000)
+            << "[TENANT-EVICT] PushOffloadingQueue failed for tenant "
+            << normalized_tenant << " on " << offload_push_failed_forced
+            << " object(s); force-evicted without disk offload "
+               "(offload_force_evict=true).";
     }
     return total;
 }

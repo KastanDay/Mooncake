@@ -1008,8 +1008,11 @@ class MasterService {
     // over, or most of its keys under a read lease). If that budget runs out,
     // hands the demand to the background trim and returns false: the write is
     // refused (TENANT_QUOTA_EXCEEDED), and its retry finds the room.
+    // A tenant already more than kInlineQuotaOverageBytes over is refused
+    // without an inline scan: its trim is due.
     bool MakeRoomForWrite(const TenantId& tenant_id, uint64_t deficit_bytes);
     static constexpr size_t kInlineEvictionKeyBudget = 4096;
+    static constexpr uint64_t kInlineQuotaOverageBytes = 256ULL << 20;
     // quota_trim_worker_'s job: evicts every tenant down to its effective
     // quota, plus what refused writes asked for, a shard at a time.
     void TrimTenantsOverQuota();
