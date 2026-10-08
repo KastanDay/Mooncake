@@ -2177,6 +2177,8 @@ class MasterService {
     const bool allow_evict_soft_pinned_objects_;
 
     // Eviction related members
+    // When BatchEvict last found nothing evictable (eviction thread only).
+    std::chrono::steady_clock::time_point last_empty_census_{};
     std::atomic<bool> need_mem_eviction_{
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{

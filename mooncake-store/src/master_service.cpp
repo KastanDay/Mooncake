@@ -1501,21 +1501,36 @@ void MasterService::ScheduleQuotaTrimIfOver() {
 
 bool MasterService::MakeRoomForWrite(const TenantId& tenant_id,
                                      uint64_t deficit_bytes) {
-    // Already far over (a capacity drop or a lowered quota): the trim is
-    // due, and an inline scan would only spend this RPC's IO thread before
-    // refusing anyway.
     const auto tenant = tenant_quota_table_.GetTenantSnapshot(tenant_id);
-    if (tenant && tenant->charged_bytes > tenant->effective_quota_bytes +
-                                              kInlineQuotaOverageBytes) {
+    const uint64_t overage =
+        tenant && tenant->charged_bytes > tenant->effective_quota_bytes
+            ? tenant->charged_bytes - tenant->effective_quota_bytes
+            : 0;
+    // The trim evicts the tenant's overage anyway; what a refused write adds
+    // is its own size.
+    const uint64_t own_bytes =
+        deficit_bytes > overage ? deficit_bytes - overage : 0;
+    auto refuse = [&] {
         {
             std::lock_guard<std::mutex> lock(quota_trim_demand_mutex_);
             auto& demand = quota_trim_demand_[tenant_id];
-            demand = std::max(demand, deficit_bytes);
+            demand = std::max(demand, own_bytes);
         }
         quota_trim_worker_.Schedule();
         return false;
-    }
+    };
+    // Already far over (a capacity drop or a lowered quota): the trim is
+    // due, and an inline scan would only spend this RPC's IO thread before
+    // refusing anyway. Likewise right after this thread's budget ran out for
+    // the tenant (the rest of a batch, or its next write): the trim has it.
+    thread_local std::optional<TenantId> exhausted_tenant;
+    thread_local std::chrono::steady_clock::time_point exhausted_at;
     const auto started = std::chrono::steady_clock::now();
+    if (overage > kInlineQuotaOverageBytes ||
+        (exhausted_tenant == tenant_id &&
+         started - exhausted_at < std::chrono::milliseconds(100))) {
+        return refuse();
+    }
     const auto result = EvictTenantMemoryForQuota(tenant_id, deficit_bytes,
                                                   kInlineEvictionKeyBudget);
     const auto elapsed_ms =
@@ -1532,13 +1547,9 @@ bool MasterService::MakeRoomForWrite(const TenantId& tenant_id,
     if (result.freed_bytes >= deficit_bytes || !result.budget_exhausted) {
         return true;  // Room made, or nothing more is evictable: as before.
     }
-    {
-        std::lock_guard<std::mutex> lock(quota_trim_demand_mutex_);
-        auto& demand = quota_trim_demand_[tenant_id];
-        demand = std::max(demand, deficit_bytes - result.freed_bytes);
-    }
-    quota_trim_worker_.Schedule();
-    return false;
+    exhausted_tenant = tenant_id;
+    exhausted_at = std::chrono::steady_clock::now();
+    return refuse();
 }
 
 void MasterService::TrimTenantsOverQuota() {
@@ -9321,8 +9332,15 @@ void MasterService::EvictionThreadFunc() {
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
+        // A failed write sets need_mem_eviction_; after a census that found
+        // nothing evictable (no capacity left, say), wait a second before the
+        // next rather than running a full census every poll.
+        const bool census_recently_empty =
+            std::chrono::steady_clock::now() - last_empty_census_ <
+            std::chrono::seconds(1);
         if (used_ratio > eviction_high_watermark_ratio_ ||
-            (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
+            (need_mem_eviction_ && eviction_ratio_ > 0.0 &&
+             !census_recently_empty)) {
             LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
                       << " high_watermark=" << eviction_high_watermark_ratio_
                       << " need_mem_eviction=" << need_mem_eviction_
@@ -10203,6 +10221,12 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                      !total.budget_exhausted;
                      ++b) {
                     const size_t bucket = (first + b) % buckets;
+                    // An empty bucket costs a visit too (a map left sparse
+                    // by a spill, before BatchEvict shrinks it).
+                    if (++keys_examined > max_keys_examined) {
+                        total.budget_exhausted = true;
+                        break;
+                    }
                     keys.clear();
                     for (auto lit = metadata_map.cbegin(bucket);
                          lit != metadata_map.cend(bucket); ++lit) {
@@ -10730,6 +10754,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     if (total_eviction_base == 0) {
         need_mem_eviction_ = false;
+        last_empty_census_ = std::chrono::steady_clock::now();
         VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
                 << " eviction_base=0 (no evictable memory objects)";
         return;

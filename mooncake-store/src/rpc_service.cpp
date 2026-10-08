@@ -498,6 +498,7 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
 
     size_t failure_count = 0;
     int no_available_handle_count = 0;
+    int quota_exceeded_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
@@ -507,6 +508,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                         << keys[i] << "': " << toString(error);
             } else if (error == ErrorCode::NO_AVAILABLE_HANDLE) {
                 no_available_handle_count++;
+            } else if (error == ErrorCode::TENANT_QUOTA_EXCEEDED) {
+                // Counted per tenant and reason by the quota metrics.
+                quota_exceeded_count++;
             } else {
                 LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
                            << keys[i] << "': " << toString(error);
@@ -517,6 +521,11 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     if (no_available_handle_count > 0) {
         LOG(WARNING) << "BatchPutStart failed for " << no_available_handle_count
                      << " keys" << PUT_NO_SPACE_HELPER_STR;
+    }
+    if (quota_exceeded_count > 0) {
+        LOG_EVERY_N(WARNING, 1000)
+            << "BatchPutStart refused " << quota_exceeded_count
+            << " keys: TENANT_QUOTA_EXCEEDED (every 1000th batch logged)";
     }
 
     if (failure_count == total_keys) {
@@ -727,8 +736,14 @@ WrappedMasterService::BatchUpsertStart(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchUpsertStart failed for key[" << i << "] '"
-                       << keys[i] << "': " << toString(error);
+            if (error == ErrorCode::TENANT_QUOTA_EXCEEDED) {
+                LOG_EVERY_N(WARNING, 1000)
+                    << "BatchUpsertStart refused key[" << i << "] '" << keys[i]
+                    << "': TENANT_QUOTA_EXCEEDED (every 1000th logged)";
+            } else {
+                LOG(ERROR) << "BatchUpsertStart failed for key[" << i << "] '"
+                           << keys[i] << "': " << toString(error);
+            }
         }
     }
 

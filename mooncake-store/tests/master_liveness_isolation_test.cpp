@@ -1034,6 +1034,10 @@ TEST_F(MasterLivenessIsolationTest, LargeQuotaOverageIsTrimmedNotInline) {
 
     TrimNow(*service);
     EXPECT_LE(Charged(*service, "trim"), Effective(*service, "trim"));
+    // The refused write's demand is its own 64 KiB, not the whole overage
+    // again: the trim did not evict twice the shortfall.
+    EXPECT_GE(Charged(*service, "trim") + 1024 * kKiB,
+              Effective(*service, "trim"));
     EXPECT_TRUE(PutIn(*service, a, "trim", "trim_new", 64 * kKiB).has_value());
 }
 
