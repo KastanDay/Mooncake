@@ -1531,8 +1531,9 @@ bool MasterService::MakeRoomForWrite(const TenantId& tenant_id,
          started - exhausted_at < std::chrono::milliseconds(100))) {
         return refuse();
     }
-    const auto result = EvictTenantMemoryForQuota(tenant_id, deficit_bytes,
-                                                  kInlineEvictionKeyBudget);
+    const auto result = EvictTenantMemoryForQuota(
+        tenant_id, deficit_bytes, kInlineEvictionKeyBudget,
+        started + kInlineEvictionTimeBudget);
     const auto elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started)
@@ -10014,9 +10015,9 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
 }
 
 MasterService::TenantQuotaEvictionResult
-MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
-                                         uint64_t target_bytes,
-                                         size_t max_keys_examined) {
+MasterService::EvictTenantMemoryForQuota(
+    const TenantId& tenant_id, uint64_t target_bytes, size_t max_keys_examined,
+    std::chrono::steady_clock::time_point deadline) {
     TenantQuotaEvictionResult total;
     if (!enable_multi_tenants_ || target_bytes == 0) {
         return total;
@@ -10189,6 +10190,15 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     };
 
     size_t keys_examined = 0;
+    // Counts a key or bucket visit; the clock is read every 32 visits.
+    auto over_budget = [&] {
+        if (++keys_examined > max_keys_examined ||
+            ((keys_examined & 31) == 0 &&
+             std::chrono::steady_clock::now() >= deadline)) {
+            total.budget_exhausted = true;
+        }
+        return total.budget_exhausted;
+    };
     auto pass = [&](bool allow_soft_pinned) {
         const size_t start_shard = randomIndex(kNumShards);
         for (size_t scanned = 0;
@@ -10223,8 +10233,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     const size_t bucket = (first + b) % buckets;
                     // An empty bucket costs a visit too (a map left sparse
                     // by a spill, before BatchEvict shrinks it).
-                    if (++keys_examined > max_keys_examined) {
-                        total.budget_exhausted = true;
+                    if (over_budget()) {
                         break;
                     }
                     keys.clear();
@@ -10236,8 +10245,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                         if (total.freed_bytes >= target_bytes) {
                             break;
                         }
-                        if (++keys_examined > max_keys_examined) {
-                            total.budget_exhausted = true;
+                        if (over_budget()) {
                             break;
                         }
                         auto it = metadata_map.find(key);

@@ -1012,6 +1012,9 @@ class MasterService {
     // without an inline scan: its trim is due.
     bool MakeRoomForWrite(const TenantId& tenant_id, uint64_t deficit_bytes);
     static constexpr size_t kInlineEvictionKeyBudget = 4096;
+    // And at most this long: under shard contention (BatchEvict, a trim) an
+    // eviction costs far more than its key count suggests.
+    static constexpr std::chrono::milliseconds kInlineEvictionTimeBudget{10};
     static constexpr uint64_t kInlineQuotaOverageBytes = 256ULL << 20;
     // quota_trim_worker_'s job: evicts every tenant down to its effective
     // quota, plus what refused writes asked for, a shard at a time.
@@ -1021,10 +1024,12 @@ class MasterService {
     std::mutex quota_trim_demand_mutex_;  // A leaf.
     std::unordered_map<TenantId, uint64_t, TenantIdHash> quota_trim_demand_;
     // Evicts up to target_bytes of the tenant's memory replicas, examining at
-    // most max_keys_examined keys.
+    // most max_keys_examined keys and stopping at `deadline`.
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes,
-        size_t max_keys_examined = std::numeric_limits<size_t>::max());
+        size_t max_keys_examined = std::numeric_limits<size_t>::max(),
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max());
 
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
