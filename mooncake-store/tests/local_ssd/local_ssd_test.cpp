@@ -124,10 +124,11 @@ TEST(LocalSsdManagerTest, TouchPromotionIsClientScoped) {
     UUID other{9, 10};
     ASSERT_TRUE(manager.RegisterClient(client, false) == ErrorCode::OK);
     ASSERT_TRUE(manager.RegisterClient(other, false) == ErrorCode::OK);
-    ASSERT_TRUE(manager.EnqueuePromotion(client, Promotion("t", "a", 1)) ==
-                ErrorCode::OK);
-    ASSERT_TRUE(manager.EnqueuePromotion(client, Promotion("t", "b", 2)) ==
-                ErrorCode::OK);
+    const uint64_t generation = manager.Generation(client).value();
+    ASSERT_TRUE(manager.EnqueuePromotion(client, Promotion("t", "a", 1),
+                                         generation) == ErrorCode::OK);
+    ASSERT_TRUE(manager.EnqueuePromotion(client, Promotion("t", "b", 2),
+                                         generation) == ErrorCode::OK);
 
     // Unknown clients and foreign clients cannot touch the entry.
     EXPECT_FALSE(manager.TouchPromotion(UUID{11, 12}, TenantId("t"), "a"));
@@ -150,7 +151,10 @@ TEST(LocalSsdManagerTest, ManagesRegistrationCapacityAndUsage) {
     ASSERT_TRUE(change.has_value());
     EXPECT_EQ(change->previous_bytes, 0);
     EXPECT_EQ(change->current_bytes, 1024);
-    EXPECT_TRUE(manager.AdjustUsedBytes(client, 300));
+    const uint64_t generation = manager.Generation(client).value();
+    EXPECT_TRUE(manager.AdjustUsedBytes(client, 300, generation));
+    EXPECT_FALSE(manager.AdjustUsedBytes(client, 300, 0))
+        << "generation 0 names no registration";
     auto usage = manager.GetUsage(client);
     ASSERT_TRUE(usage.has_value());
     EXPECT_EQ(usage->total_capacity_bytes, 1024);
@@ -160,17 +164,18 @@ TEST(LocalSsdManagerTest, ManagesRegistrationCapacityAndUsage) {
     ASSERT_TRUE(capacity.has_value());
     EXPECT_EQ(*capacity, 1024);
     EXPECT_FALSE(manager.GetUsage(client).has_value());
-    EXPECT_FALSE(manager.AdjustUsedBytes(client, 1));
+    EXPECT_FALSE(manager.AdjustUsedBytes(client, 1, generation));
 }
 
 TEST(LocalSsdManagerTest, UnregisterSerializesWithConcurrentOperations) {
     LocalSsdManager manager;
     UUID client{3, 4};
     ASSERT_TRUE(manager.RegisterClient(client, true) == ErrorCode::OK);
+    const uint64_t generation = manager.Generation(client).value();
     std::atomic<bool> stop{false};
     std::thread worker([&] {
         while (!stop.load(std::memory_order_relaxed)) {
-            manager.AdjustUsedBytes(client, 1);
+            manager.AdjustUsedBytes(client, 1, generation);
             manager.GetUsage(client);
         }
     });
@@ -219,11 +224,12 @@ TEST(LocalSsdManagerTest, RestoreResetsRuntimeOnlyState) {
     UUID client{5, 6};
     ASSERT_TRUE(manager.RegisterClient(client, true) == ErrorCode::OK);
     ASSERT_TRUE(manager.ReportCapacity(client, 2048).has_value());
-    ASSERT_TRUE(manager.AdjustUsedBytes(client, 512));
+    const uint64_t generation = manager.Generation(client).value();
+    ASSERT_TRUE(manager.AdjustUsedBytes(client, 512, generation));
     ASSERT_TRUE(manager.EnqueueOffload(client, Offload("tenant", "key", 10),
                                        10) == ErrorCode::OK);
-    ASSERT_TRUE(manager.EnqueuePromotion(
-                    client, Promotion("tenant", "key", 10)) == ErrorCode::OK);
+    ASSERT_TRUE(manager.EnqueuePromotion(client, Promotion("tenant", "key", 10),
+                                         generation) == ErrorCode::OK);
     manager.RequestRemoveAll();
 
     auto state = manager.ExportPersistedState();

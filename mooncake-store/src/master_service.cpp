@@ -1004,7 +1004,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 }
             }
         }
-        if (ok_client_.contains(client_id)) {
+        bool already_ok = false;
+        {
+            std::lock_guard<std::mutex> lock(liveness_mutex_);
+            auto it = client_liveness_.find(client_id);
+            already_ok = it != client_liveness_.end() && it->second.ok;
+        }
+        if (already_ok) {
             LOG(WARNING) << "client_id=" << client_id
                          << ", warn=client_already_remounted";
             // Return OK because this is an idempotent operation
@@ -1250,9 +1256,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         }
 
         // Change the client status to OK
-        ok_client_.insert(client_id);
-        SetClientLivenessOk(client_id, true);
-        MasterMetricManager::instance().inc_active_clients();
+        if (!MarkClientOk(client_id)) {
+            MasterMetricManager::instance().inc_active_clients();
+        }
     }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
@@ -2482,24 +2488,10 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
     }
 }
 
-void MasterService::ClearInvalidHandles(
-    bool lock_snapshot_per_batch,
-    const std::unordered_set<UUID, boost::hash<UUID>>& retired_owners) {
+void MasterService::ClearInvalidHandles(bool lock_snapshot_per_batch) {
     ClearStaleHandles(
-        [this, &retired_owners](const Replica& replica) {
-            if (IsReplicaReclaimable(replica)) {
-                return true;
-            }
-            // A restored replica (generation 0) is bound to no particular
-            // registration: one of an owner retired now goes with it, even
-            // if the owner registers again before this sweep reaches it.
-            if (retired_owners.empty() || !replica.is_local_disk_replica() ||
-                !replica.is_completed() ||
-                replica.get_local_disk_generation().value_or(0) != 0) {
-                return false;
-            }
-            return retired_owners.contains(
-                replica.get_local_disk_client_id().value());
+        [this](const Replica& replica) {
+            return IsReplicaReclaimable(replica);
         },
         lock_snapshot_per_batch);
 }
@@ -2508,7 +2500,11 @@ bool MasterService::IsLocalDiskRegistrationCurrent(
     const Replica& replica) const {
     const auto owner = replica.get_local_disk_client_id();
     // Without offload there is no registry to check against (and no mount or
-    // unmount to race): the same scope as the admission checks.
+    // unmount to race): the same scope as the admission checks. That mode's
+    // LOCAL_DISK replicas (admitted without a registration, as the HA and
+    // quota suites do) stay readable, and are reclaimable once their owner
+    // is no longer OK (IsReplicaReclaimable): the one predicate that is not
+    // monotone, and only in that mode.
     if (!owner || !enable_offload_) {
         return true;
     }
@@ -2541,8 +2537,9 @@ bool MasterService::IsReplicaReclaimable(const Replica& replica) const {
     if (enable_offload_) {
         return !IsLocalDiskRegistrationCurrent(replica);
     }
-    // Admitted without a registry: garbage once its owner is no longer OK,
-    // as before (liveness_mutex_ is a leaf, safe under a shard lock).
+    // Admitted without a registry (offload disabled): garbage once its owner
+    // is no longer OK, as before (liveness_mutex_ is a leaf, safe under a
+    // shard lock).
     std::lock_guard<std::mutex> lock(liveness_mutex_);
     auto it = client_liveness_.find(replica.get_local_disk_client_id().value());
     return it == client_liveness_.end() || !it->second.ok;
@@ -2552,10 +2549,14 @@ std::unique_lock<std::shared_mutex> MasterService::LockSnapshotExclusive()
     const {
     // Announced while waiting, so the cleanup pass, which re-takes the lock
     // shared for every batch, steps aside instead of starving the writer.
-    snapshot_writers_waiting_.fetch_add(1, std::memory_order_acq_rel);
-    std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
-    snapshot_writers_waiting_.fetch_sub(1, std::memory_order_acq_rel);
-    return lock;
+    struct Announce {
+        std::atomic<int>& waiting;
+        explicit Announce(std::atomic<int>& w) : waiting(w) {
+            waiting.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~Announce() { waiting.fetch_sub(1, std::memory_order_acq_rel); }
+    } announce(snapshot_writers_waiting_);
+    return std::unique_lock<std::shared_mutex>(snapshot_mutex_);
 }
 
 void MasterService::ClearStaleHandles(
@@ -2566,45 +2567,43 @@ void MasterService::ClearStaleHandles(
     auto reclaim = [&](MetadataShardAccessorRW& shard,
                        const TenantId& tenant_id, TenantState& tenant_state,
                        MetadataMap::iterator it) {
-        const auto cleanup_plan =
-            BuildStaleHandleCleanupPlan(it->second, is_stale);
-        if (!cleanup_plan.removed_ids.empty()) {
-            if (enable_ha_ && enable_oplog_) {
-                auto persist_result = PersistStaleHandleCleanupForHA(
-                    "ClearStaleHandles", tenant_id, it->first, it->second,
-                    cleanup_plan);
-                (void)persist_result;  // Finalized (or retried) after durable.
-                return;
-            }
+        if (!(enable_ha_ && enable_oplog_)) {
             if (CleanupStaleHandles(tenant_state, it->second, is_stale,
-                                    &shard)) {
+                                    &shard) ||
+                !it->second.IsValid()) {
                 EraseMetadata(tenant_state, it, tenant_id,
                               QuotaEraseMode::kFull, &shard);
             }
+            return;
+        }
+        // HA: the removal is persisted first, and applied once durable.
+        const auto cleanup_plan =
+            BuildStaleHandleCleanupPlan(it->second, is_stale);
+        if (!cleanup_plan.removed_ids.empty()) {
+            auto persist_result = PersistStaleHandleCleanupForHA(
+                "ClearStaleHandles", tenant_id, it->first, it->second,
+                cleanup_plan);
+            (void)persist_result;  // Finalized (or retried) after durable.
         } else if (!it->second.IsValid()) {
-            if (enable_ha_ && enable_oplog_) {
-                auto persist_result = AppendOpLogWithDurableFinalize(
-                    OpType::REMOVE, tenant_id.value(), it->first, {},
-                    [this](const OpLogEntry& durable_entry) {
-                        FinalizeMetadataEraseAfterDurable(
-                            durable_entry, QuotaEraseMode::kFull);
-                    });
-                if (!persist_result) {
-                    LOG(WARNING)
-                        << "ClearStaleHandles(last replica)"
-                        << ": REMOVE persist failed for key=" << it->first
-                        << ", err=" << static_cast<int>(persist_result.error());
-                }
-                return;
+            auto persist_result = AppendOpLogWithDurableFinalize(
+                OpType::REMOVE, tenant_id.value(), it->first, {},
+                [this](const OpLogEntry& durable_entry) {
+                    FinalizeMetadataEraseAfterDurable(durable_entry,
+                                                      QuotaEraseMode::kFull);
+                });
+            if (!persist_result) {
+                LOG(WARNING)
+                    << "ClearStaleHandles(last replica)"
+                    << ": REMOVE persist failed for key=" << it->first
+                    << ", err=" << static_cast<int>(persist_result.error());
             }
-            EraseMetadata(tenant_state, it, tenant_id, QuotaEraseMode::kFull,
-                          &shard);
         }
     };
 
     const auto started = std::chrono::steady_clock::now();
     size_t visited_total = 0;
     size_t reclaimed_keys = 0;
+    size_t restarts = 0;
     for (size_t i = 0; i < kNumShards; i++) {
         std::vector<TenantId> tenant_ids;
         {
@@ -2621,9 +2620,10 @@ void MasterService::ClearStaleHandles(
         for (const auto& tenant_id : tenant_ids) {
             // A bucket cursor over the tenant's map: whole buckets per batch,
             // so no position inside a bucket has to survive an unlock.
-            // Erasing never rehashes. A rehash (growth only, geometric, so
-            // rare) moves keys between buckets: the tenant then starts over,
-            // so no key is skipped; reclaiming is idempotent.
+            // Erasing never rehashes. A rehash between batches (growth, or
+            // BatchEvict shrinking a sparse map) moves keys between buckets:
+            // the tenant then starts over, so no key is skipped; reclaiming
+            // is idempotent. Both are geometric, so restarts are few.
             size_t bucket = 0;
             size_t bucket_count = 0;
             bool done = false;
@@ -2648,6 +2648,7 @@ void MasterService::ClearStaleHandles(
                 auto& tenant_state = tenant_it->second;
                 auto& metadata = tenant_state.metadata;
                 if (metadata.bucket_count() != bucket_count) {
+                    restarts += bucket_count != 0;
                     bucket = 0;
                     bucket_count = metadata.bucket_count();
                 }
@@ -2694,7 +2695,7 @@ void MasterService::ClearStaleHandles(
     if (reclaimed_keys > 0) {
         LOG(INFO) << "action=reclaim_stale_handles, keys_visited="
                   << visited_total << ", keys_reclaimed=" << reclaimed_keys
-                  << ", elapsed_ms=" << elapsed_ms;
+                  << ", restarts=" << restarts << ", elapsed_ms=" << elapsed_ms;
     } else {
         VLOG(1) << "action=reclaim_stale_handles, keys_visited="
                 << visited_total << ", elapsed_ms=" << elapsed_ms;
@@ -4885,24 +4886,24 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return true;
     }
 
+    return RebindLocalDiskReplica(metadata, replica);
+}
+
+bool MasterService::RebindLocalDiskReplica(ObjectMetadata& metadata,
+                                           const Replica& incoming) {
+    const auto owner = incoming.get_local_disk_client_id();
+    const auto generation = incoming.get_local_disk_generation();
+    bool rebound = false;
     metadata.VisitReplicas(
-        [client_id](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
+        [&owner](const Replica& rep) {
+            return rep.is_local_disk_replica() &&
+                   rep.get_local_disk_client_id() == owner;
         },
-        [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
+        [&](Replica& rep) {
+            rebound = rep.get_local_disk_generation() != generation;
+            rep.rebind_local_disk(incoming);
         });
-    return false;
+    return rebound;
 }
 
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
@@ -7291,11 +7292,11 @@ bool MasterService::ObserveClient(const UUID& client_id) {
     return liveness.ok;
 }
 
-void MasterService::SetClientLivenessOk(const UUID& client_id, bool ok) {
+bool MasterService::MarkClientOk(const UUID& client_id) {
     std::lock_guard<std::mutex> lock(liveness_mutex_);
     auto& liveness = client_liveness_[client_id];
     liveness.last_seen = std::chrono::steady_clock::now();
-    liveness.ok = ok;
+    return std::exchange(liveness.ok, true);
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
@@ -7365,7 +7366,10 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     // checking the registration inside one shared-lock section together with
     // the metadata write, so that section lands entirely before this
     // retirement (the replica is then bound to the retired generation, and
-    // garbage) or entirely after (the check refuses it).
+    // garbage) or entirely after (the check refuses it). Load-bearing for the
+    // synchronous modes, whose single sweep below must see every replica
+    // admitted under the old registration; with background cleanup the
+    // admission's own re-check under its shard lock already suffices.
     std::optional<int64_t> reported_capacity;
     {
         auto snapshot_lock = LockSnapshotExclusive();
@@ -7383,16 +7387,12 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     if (enable_async_segment_cleanup_) {
         replica_cleanup_worker_.Schedule();
     } else {
-        ClearInvalidHandles(/*lock_snapshot_per_batch=*/true, {client_id});
+        ClearInvalidHandles(/*lock_snapshot_per_batch=*/true);
     }
 
     LOG(INFO) << "client_id=" << client_id
               << ", action=unmount_local_disk_segment_by_request";
     return {};
-}
-
-bool MasterService::HasMountedLocalDiskSegment(const UUID& client_id) {
-    return local_ssd_manager_.GetUsage(client_id).has_value();
 }
 
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
@@ -7596,27 +7596,10 @@ auto MasterService::NotifyOffloadSuccess(
                         SyncCacheTotalAccounting(obj_metadata);
                         added_new_local_disk_replica = true;
                     } else {
-                        obj_metadata.VisitReplicas(
-                            [client_id](const Replica& rep) {
-                                return rep.type() == ReplicaType::LOCAL_DISK &&
-                                       rep.get_descriptor()
-                                               .get_local_disk_descriptor()
-                                               .client_id == client_id;
-                            },
-                            [&replica](Replica& rep) {
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .transport_endpoint =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .transport_endpoint;
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .object_size =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .object_size;
-                            });
+                        // Re-adoption (only HA keeps an ended registration's
+                        // replica here; elsewhere it was cleaned up above).
+                        added_new_local_disk_replica =
+                            RebindLocalDiskReplica(obj_metadata, replica);
                     }
                     handled_existing_object = true;
                 }
@@ -9725,10 +9708,6 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
     local_ssd_manager_.Clear();
 
     {
-        std::unique_lock<std::shared_mutex> lock(client_mutex_);
-        ok_client_.clear();
-    }
-    {
         std::lock_guard<std::mutex> lock(liveness_mutex_);
         client_liveness_.clear();
     }
@@ -9736,6 +9715,33 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
     MasterMetricManager::instance().reset_cache_total_nums();
+}
+
+void MasterService::BindRestoredLocalDiskReplicas() {
+    std::map<std::pair<UUID, uint64_t>, int64_t> bytes_by_registration;
+    for (auto& shard : metadata_shards_) {
+        for (auto& [tenant_id, tenant_state] : shard.tenants) {
+            for (auto& [key, metadata] : tenant_state.metadata) {
+                metadata.VisitReplicas(
+                    &Replica::fn_is_local_disk_replica, [&](Replica& replica) {
+                        const auto owner = *replica.get_local_disk_client_id();
+                        const auto generation =
+                            local_ssd_manager_.Generation(owner).value_or(0);
+                        replica.set_local_disk_generation(generation);
+                        if (generation != 0 && replica.is_completed()) {
+                            bytes_by_registration[{owner, generation}] +=
+                                replica.get_descriptor()
+                                    .get_local_disk_descriptor()
+                                    .object_size;
+                        }
+                    });
+            }
+        }
+    }
+    for (const auto& [registration, bytes] : bytes_by_registration) {
+        local_ssd_manager_.AdjustUsedBytes(registration.first, bytes,
+                                           registration.second);
+    }
 }
 
 tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
@@ -9820,6 +9826,8 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
         LOG(INFO) << "[Restore] Total allocated size after restore: "
                   << segment_manager_.GetMemoryUsage().used_bytes;
     }
+
+    BindRestoredLocalDiskReplicas();
 
     // Soft pin is runtime-only and is never restored from a snapshot.
     soft_pin_deadline_index_.Clear();
@@ -11209,7 +11217,7 @@ void MasterService::ExpireClients(const std::vector<UUID>& candidates,
     std::vector<size_t> dec_capacities;
     std::vector<UUID> client_ids;
     std::vector<std::string> segment_names;
-    bool retired_disk = false;
+    size_t expired_ok = 0;
     {
         // snapshot_mutex_ before client_mutex_ (the global lock order):
         // nothing here holds client_mutex_ while it waits.
@@ -11224,6 +11232,7 @@ void MasterService::ExpireClients(const std::vector<UUID>& candidates,
                     auto it = client_liveness_.find(client_id);
                     if (it != client_liveness_.end() &&
                         it->second.last_seen + ttl <= now) {
+                        expired_ok += it->second.ok;
                         client_liveness_.erase(it);
                         expired_clients.push_back(client_id);
                     }
@@ -11235,10 +11244,10 @@ void MasterService::ExpireClients(const std::vector<UUID>& candidates,
             for (const auto& client_id : expired_clients) {
                 LOG(INFO) << "client_id=" << client_id
                           << ", action=client_expired";
-                if (ok_client_.erase(client_id) != 0) {
-                    MasterMetricManager::instance().dec_active_clients();
-                }
                 client_host_id_.erase(client_id);
+            }
+            for (size_t i = 0; i < expired_ok; ++i) {
+                MasterMetricManager::instance().dec_active_clients();
             }
 
             // Prepare releases each segment's allocator: from here on no
@@ -11273,12 +11282,9 @@ void MasterService::ExpireClients(const std::vector<UUID>& candidates,
         // before the cleanup pass reaches its shard or is refused.
         for (const auto& client_id : expired_clients) {
             auto capacity = local_ssd_manager_.UnregisterClient(client_id);
-            if (capacity) {
-                retired_disk = true;
-                if (*capacity > 0) {
-                    MasterMetricManager::instance().dec_total_file_capacity(
-                        *capacity);
-                }
+            if (capacity && *capacity > 0) {
+                MasterMetricManager::instance().dec_total_file_capacity(
+                    *capacity);
             }
         }
 
@@ -11287,10 +11293,7 @@ void MasterService::ExpireClients(const std::vector<UUID>& candidates,
         // segments and registrations is garbage, reclaimed by the cleanup
         // worker: the same order UnmountSegment uses.
         if (!enable_async_segment_cleanup_) {
-            ClearInvalidHandles(
-                /*lock_snapshot_per_batch=*/false,
-                std::unordered_set<UUID, boost::hash<UUID>>(
-                    expired_clients.begin(), expired_clients.end()));
+            ClearInvalidHandles(/*lock_snapshot_per_batch=*/false);
         }
 
         {
@@ -11318,8 +11321,10 @@ void MasterService::ExpireClients(const std::vector<UUID>& candidates,
         }
     }
     RecomputeTenantEffectiveQuotas();
-    if (enable_async_segment_cleanup_ &&
-        (!unmount_segments.empty() || retired_disk)) {
+    // Every expiry may leave garbage behind (with offload disabled, LOCAL_DISK
+    // replicas of an owner with neither segments nor a registration): one
+    // coalesced pass reclaims it.
+    if (enable_async_segment_cleanup_) {
         replica_cleanup_worker_.Schedule();
     }
 }

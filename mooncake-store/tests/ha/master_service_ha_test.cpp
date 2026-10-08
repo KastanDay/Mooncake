@@ -796,7 +796,8 @@ class MasterServiceHATest : public ::testing::Test {
         auto usage = service.local_ssd_manager_.GetUsage(client_id);
         ASSERT_TRUE(usage.has_value());
         service.local_ssd_manager_.AdjustUsedBytes(
-            client_id, used_bytes - usage->used_bytes);
+            client_id, used_bytes - usage->used_bytes,
+            service.local_ssd_manager_.Generation(client_id).value());
     }
 
     static int64_t GetLocalDiskUsedBytesForTesting(

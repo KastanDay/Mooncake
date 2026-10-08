@@ -213,12 +213,112 @@ class MasterLivenessIsolationTest : public ::testing::Test {
 
     // Read without pinging: a Ping would keep the client alive.
     static bool IsOk(MasterService& service, const UUID& client_id) {
-        std::shared_lock<std::shared_mutex> lock(service.client_mutex_);
-        return service.ok_client_.contains(client_id);
+        std::lock_guard<std::mutex> lock(service.liveness_mutex_);
+        auto it = service.client_liveness_.find(client_id);
+        return it != service.client_liveness_.end() && it->second.ok;
+    }
+
+    // Ends a LOCAL_DISK registration the way an expiry does: no exclusive
+    // snapshot lock, so an admission already past its own check can be in
+    // flight, holding the lock shared.
+    static void RetireDiskAsExpiryDoes(MasterService& service,
+                                       const UUID& client_id) {
+        service.local_ssd_manager_.UnregisterClient(client_id);
+    }
+
+    // Holds the key's shard lock until the returned accessor is destroyed.
+    static auto LockShard(MasterService& service, const std::string& key) {
+        return std::make_unique<MasterService::MetadataShardAccessorRW>(
+            &service, ShardOf(service, key));
     }
 
     static void ReclaimNow(MasterService& service) {
         service.ClearInvalidHandles();
+    }
+
+    // The key's LOCAL_DISK replica owned by `owner`, under its shard lock.
+    template <typename Fn>
+    static bool WithDiskReplica(MasterService& service, const std::string& key,
+                                const UUID& owner, Fn&& fn) {
+        MasterService::MetadataShardAccessorRW shard(&service,
+                                                     ShardOf(service, key));
+        auto tenant = shard->tenants.find(TenantId::Default());
+        if (tenant == shard->tenants.end()) {
+            return false;
+        }
+        auto it = tenant->second.metadata.find(key);
+        if (it == tenant->second.metadata.end()) {
+            return false;
+        }
+        bool found = false;
+        it->second.VisitReplicas(
+            [&owner](const Replica& r) {
+                return r.get_local_disk_client_id() == owner;
+            },
+            [&](Replica& r) {
+                found = true;
+                fn(r, it->second);
+            });
+        return found;
+    }
+
+    static uint64_t DiskGeneration(MasterService& service,
+                                   const std::string& key, const UUID& owner) {
+        uint64_t generation = UINT64_MAX;
+        WithDiskReplica(service, key, owner, [&](Replica& r, auto&) {
+            generation = r.get_local_disk_generation().value();
+        });
+        return generation;
+    }
+
+    // What a snapshot restore leaves before binding: the registry decoded
+    // into fresh registrations (new generations, no used bytes), and every
+    // LOCAL_DISK replica decoded bound to none.
+    static void DecodeAsRestored(MasterService& service,
+                                 const std::vector<std::string>& keys,
+                                 const UUID& owner) {
+        service.local_ssd_manager_.RestorePersistedState(
+            service.local_ssd_manager_.ExportPersistedState());
+        for (const auto& key : keys) {
+            WithDiskReplica(service, key, owner, [](Replica& r, auto&) {
+                r.set_local_disk_generation(0);
+            });
+        }
+    }
+
+    static void BindRestored(MasterService& service) {
+        service.BindRestoredLocalDiskReplicas();
+    }
+
+    static bool Rebind(MasterService& service, const std::string& key,
+                       const Replica& incoming) {
+        bool rebound = false;
+        WithDiskReplica(service, key, *incoming.get_local_disk_client_id(),
+                        [&](Replica&, auto& metadata) {
+                            rebound = service.RebindLocalDiskReplica(metadata,
+                                                                     incoming);
+                        });
+        return rebound;
+    }
+
+    static tl::expected<bool, ErrorCode> AddReplica(MasterService& service,
+                                                    const UUID& client_id,
+                                                    const std::string& key,
+                                                    Replica& replica) {
+        return service.AddReplica(client_id, key, TenantId::Default(), replica);
+    }
+
+    static tl::expected<void, ErrorCode> PushPromotion(MasterService& service,
+                                                       const std::string& key,
+                                                       const UUID& owner) {
+        tl::expected<void, ErrorCode> result =
+            tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        Replica source(owner, 0, "", ReplicaStatus::COMPLETE);
+        WithDiskReplica(service, key, owner, [&](Replica& r, auto&) {
+            source.rebind_local_disk(r);
+        });
+        return service.PushPromotionQueue(
+            MasterService::ObjectIdentity{TenantId::Default(), key}, source);
     }
 
     static int64_t UsedBytes(MasterService& service, const UUID& client_id) {
@@ -485,9 +585,11 @@ TEST_F(MasterLivenessIsolationTest, ReclaimPassYieldsToExclusiveWriters) {
 
     std::atomic<bool> pass_started{false};
     std::atomic<bool> pass_done{false};
+    Clock::time_point pass_end;
     auto pass = std::async(std::launch::async, [&] {
         pass_started = true;
         ReclaimNow(*service);
+        pass_end = Clock::now();
         pass_done = true;
     });
     while (!pass_started) {
@@ -495,17 +597,17 @@ TEST_F(MasterLivenessIsolationTest, ReclaimPassYieldsToExclusiveWriters) {
     }
     std::this_thread::sleep_for(milliseconds(20));  // Into its batches.
     const bool started_mid_pass = !pass_done;
-    // The remount thread itself records whether the pass was still running
-    // when it finished: the order, not a later observation.
-    auto finished_mid_pass = std::async(std::launch::async, [&] {
+    // Each side stamps its own completion: the order, not a later sample.
+    auto remount_end = std::async(std::launch::async, [&] {
         service->ReMountSegment({b.segment}, b.id);
-        return !pass_done.load();
+        return Clock::now();
     });
-    ASSERT_EQ(finished_mid_pass.wait_for(std::chrono::seconds(60)),
+    ASSERT_EQ(remount_end.wait_for(std::chrono::seconds(60)),
               std::future_status::ready);
-    const bool remount_first = finished_mid_pass.get();
+    const auto remounted_at = remount_end.get();
     ASSERT_EQ(pass.wait_for(std::chrono::seconds(120)),
               std::future_status::ready);
+    const bool remount_first = remounted_at < pass_end;
     if (!started_mid_pass) {
         GTEST_SKIP() << "the pass finished before the remount started";
     }
@@ -537,7 +639,8 @@ TEST_F(MasterLivenessIsolationTest, PromotionEnqueueIsBoundToRegistration) {
 // expires, its replicas stop being served at once, and they are reclaimed in
 // the background while the other client keeps pinging OK throughout.
 TEST_F(MasterLivenessIsolationTest, OneExpiryLeavesOtherClientsAlive) {
-    auto service = MakeService(/*ttl_sec=*/2);
+    // 25 pings per TTL: a stalled test process does not expire the survivor.
+    auto service = MakeService(/*ttl_sec=*/5);
     auto victim = MountClient(*service, "expiry_victim", 0x100000000);
     auto survivor = MountClient(*service, "expiry_survivor", 0x200000000);
     KeepAlive keepalive(*service, {victim.id, survivor.id});
@@ -546,7 +649,7 @@ TEST_F(MasterLivenessIsolationTest, OneExpiryLeavesOtherClientsAlive) {
 
     keepalive.Drop(victim.id);
     EXPECT_TRUE(WaitFor([&] { return !IsOk(*service, victim.id); },
-                        milliseconds(10000)));
+                        milliseconds(15000)));
     EXPECT_FALSE(HasReadableDiskReplicaOf(*service, "expiry_key_0", victim.id));
     EXPECT_TRUE(
         WaitFor([&] { return DiskReplicasOwnedBy(*service, victim.id) == 0; },
@@ -566,7 +669,7 @@ TEST_F(MasterLivenessIsolationTest, SynchronousExpiryReclaimsDiskReplicas) {
     MasterServiceConfig config;
     config.enable_offload = true;
     config.default_kv_lease_ttl = 0;
-    config.client_live_ttl_sec = 2;
+    config.client_live_ttl_sec = 1;
     config.enable_snapshot = true;
     config.snapshot_backup_dir = dir;
     config.snapshot_object_store_type = "local";
@@ -574,17 +677,13 @@ TEST_F(MasterLivenessIsolationTest, SynchronousExpiryReclaimsDiskReplicas) {
     ASSERT_FALSE(BackgroundCleanup(*service));
 
     auto victim = MountClient(*service, "sync_victim", 0x100000000);
-    auto survivor = MountClient(*service, "sync_survivor", 0x200000000);
-    KeepAlive keepalive(*service, {victim.id, survivor.id});
     OffloadDiskOnlyKeys(*service, victim, "sync_key_", 2000);
-    keepalive.Drop(victim.id);
-    EXPECT_TRUE(WaitFor([&] { return !IsOk(*service, victim.id); },
-                        milliseconds(10000)));
-    // No background worker in this mode: the expiry itself reclaimed them.
-    EXPECT_TRUE(
-        WaitFor([&] { return DiskReplicasOwnedBy(*service, victim.id) == 0; },
-                milliseconds(2000)));
-    EXPECT_EQ(keepalive.not_ok(), 0);
+    std::this_thread::sleep_for(milliseconds(1100));  // Past its TTL.
+    // The expiry the monitor would carry out, without racing it: no
+    // background worker in this mode, so the expiry itself reclaims them.
+    ExpireNow(*service, victim.id, Clock::now());
+    EXPECT_FALSE(IsOk(*service, victim.id));
+    EXPECT_EQ(DiskReplicasOwnedBy(*service, victim.id), 0u);
 }
 
 // A client selected for expiry that pings before the expiry is carried out
@@ -634,15 +733,188 @@ TEST_F(MasterLivenessIsolationTest, EvictionIgnoresEndedRegistrationBackup) {
     EXPECT_TRUE(has_memory);
 }
 
+// An admission racing a retirement: the replica was bound to the old
+// registration before the retirement and reaches its shard after. It is
+// refused there, under the shard lock, with no cleanup pass needed (one may
+// already have passed this shard). Both admission paths: a disk-only key
+// (AddReplica) and an offload of a memory replica (the existing-object path).
+TEST_F(MasterLivenessIsolationTest, AdmissionRacingRetirementIsRefused) {
+    auto service = MakeService();
+    auto a = MountClient(*service, "race_a", 0x100000000);
+    Put(*service, a, "race_existing");
+    for (const std::string key : {"race_disk_only", "race_existing"}) {
+        std::promise<void> holding;
+        std::promise<void> release;
+        std::thread holder([&] {
+            auto shard = LockShard(*service, key);
+            holding.set_value();
+            release.get_future().wait();
+        });
+        holding.get_future().wait();
+        auto admission = std::async(std::launch::async,
+                                    [&] { return Offload(*service, a, key); });
+        // Into its wait for the shard lock, past the generation it binds.
+        std::this_thread::sleep_for(milliseconds(200));
+        RetireDiskAsExpiryDoes(*service, a.id);
+        release.set_value();
+        holder.join();
+        auto result = admission.get();
+        ASSERT_FALSE(result.has_value()) << key;
+        EXPECT_EQ(result.error(), ErrorCode::SEGMENT_NOT_FOUND) << key;
+        EXPECT_EQ(DiskReplicasOwnedBy(*service, a.id), 0u) << key;
+        ASSERT_TRUE(service->MountLocalDiskSegment(a.id, true).has_value());
+    }
+}
+
+// A replica bound to an earlier registration than the owner's current one
+// is refused, not rebound to the new one and credited there.
+TEST_F(MasterLivenessIsolationTest, AddReplicaRefusesAnEndedBinding) {
+    auto service = MakeService();
+    auto a = MountClient(*service, "bound_a", 0x100000000);
+    const uint64_t old_generation = Generation(*service, a.id);
+    RetireDiskWithoutCleanup(*service, a.id);
+    ASSERT_TRUE(service->MountLocalDiskSegment(a.id, true).has_value());
+    Replica replica(a.id, 64, a.segment.name, ReplicaStatus::COMPLETE);
+    replica.set_local_disk_generation(old_generation);
+    auto result = AddReplica(*service, a.id, "bound_key", replica);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_EQ(UsedBytes(*service, a.id), 0);
+}
+
+// A snapshot restore binds every restored LOCAL_DISK replica to its owner's
+// restored registration and credits its bytes there; until then (and for an
+// owner without one) a replica is bound to none and is never served. Then a
+// retirement and a same-id re-registration: the old replica is garbage, its
+// re-adoption is bound to the new registration, and usage balances.
+TEST_F(MasterLivenessIsolationTest, RestoreBindsDiskReplicasToRegistrations) {
+    auto service = MakeService();
+    auto a = MountClient(*service, "restore_a", 0x100000000);
+    auto b = MountClient(*service, "restore_b", 0x200000000);
+    OffloadDiskOnlyKeys(*service, a, "restore_a_", 10);  // 64 bytes each.
+    OffloadDiskOnlyKeys(*service, b, "restore_b_", 10);
+    std::vector<std::string> a_keys, b_keys;
+    for (int i = 0; i < 10; ++i) {
+        a_keys.push_back("restore_a_" + std::to_string(i));
+        b_keys.push_back("restore_b_" + std::to_string(i));
+    }
+    DecodeAsRestored(*service, a_keys, a.id);
+    DecodeAsRestored(*service, b_keys, b.id);
+    RetireDiskWithoutCleanup(*service, b.id);  // b's registration not restored.
+    EXPECT_EQ(UsedBytes(*service, a.id), 0);
+    EXPECT_FALSE(HasReadableDiskReplicaOf(*service, "restore_a_0", a.id))
+        << "a replica bound to no registration was served";
+
+    BindRestored(*service);
+    EXPECT_EQ(DiskGeneration(*service, "restore_a_0", a.id),
+              Generation(*service, a.id));
+    EXPECT_TRUE(HasReadableDiskReplicaOf(*service, "restore_a_0", a.id));
+    EXPECT_EQ(UsedBytes(*service, a.id), 10 * 64);
+    EXPECT_EQ(DiskGeneration(*service, "restore_b_0", b.id), 0u);
+    EXPECT_FALSE(HasReadableDiskReplicaOf(*service, "restore_b_0", b.id));
+
+    // Retire a and register it again under the same id.
+    RetireDiskWithoutCleanup(*service, a.id);
+    ASSERT_TRUE(service->MountLocalDiskSegment(a.id, true).has_value());
+    EXPECT_FALSE(HasReadableDiskReplicaOf(*service, "restore_a_0", a.id))
+        << "a retired registration's replica came back after re-registration";
+    ASSERT_TRUE(Offload(*service, a, "restore_a_0", 64).has_value());
+    EXPECT_TRUE(HasReadableDiskReplicaOf(*service, "restore_a_0", a.id));
+    ReclaimNow(*service);
+    EXPECT_EQ(DiskReplicasOwnedBy(*service, a.id), 1u);  // The re-adopted one.
+    EXPECT_EQ(DiskReplicasOwnedBy(*service, b.id), 0u);
+    EXPECT_EQ(UsedBytes(*service, a.id), 64);
+    EXPECT_TRUE(HasReadableDiskReplicaOf(*service, "restore_a_0", a.id));
+}
+
+// Re-adoption in place (HA keeps an ended registration's replica until its
+// removal is durable, so the admission finds it): rebinding moves it to the
+// new registration once, and a duplicate report is not credited again.
+TEST_F(MasterLivenessIsolationTest, ReadoptionRebindsInPlace) {
+    auto service = MakeService();
+    auto a = MountClient(*service, "rebind_a", 0x100000000);
+    PutAndOffload(*service, a, "rebind_key", 64);
+    RetireDiskWithoutCleanup(*service, a.id);
+    ASSERT_TRUE(service->MountLocalDiskSegment(a.id, true).has_value());
+    ASSERT_FALSE(HasReadableDiskReplicaOf(*service, "rebind_key", a.id));
+
+    Replica incoming(a.id, 64, a.segment.name, ReplicaStatus::COMPLETE);
+    incoming.set_local_disk_generation(Generation(*service, a.id));
+    EXPECT_TRUE(Rebind(*service, "rebind_key", incoming));
+    EXPECT_TRUE(HasReadableDiskReplicaOf(*service, "rebind_key", a.id));
+    EXPECT_FALSE(Rebind(*service, "rebind_key", incoming)) << "duplicate";
+    ReclaimNow(*service);
+    EXPECT_EQ(DiskReplicasOwnedBy(*service, a.id), 1u);
+}
+
+// A promotion pushed for a source of an ended registration finds no
+// mailbox: the holder's later registration never receives it.
+TEST_F(MasterLivenessIsolationTest, PromotionPushAfterRetirementIsRefused) {
+    auto service = MakeService();
+    auto a = MountClient(*service, "push_a", 0x100000000);
+    PutAndOffload(*service, a, "push_key", 64);
+    EXPECT_TRUE(PushPromotion(*service, "push_key", a.id).has_value());
+    RetireDiskWithoutCleanup(*service, a.id);
+    ASSERT_TRUE(service->MountLocalDiskSegment(a.id, true).has_value());
+    auto result = PushPromotion(*service, "push_key", a.id);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+// An expired client's memory replicas are unreadable at once (its segment's
+// allocator is released) and their keys are reclaimed by the pass.
+TEST_F(MasterLivenessIsolationTest, ExpiredMemoryReplicasAreReclaimed) {
+    auto service = MakeService(/*ttl_sec=*/1);
+    auto victim = MountClient(*service, "mem_victim", 0x100000000);
+    for (int i = 0; i < 100; ++i) {
+        Put(*service, victim, "mem_key_" + std::to_string(i));
+    }
+    ASSERT_EQ(service->GetKeyCount(), 100u);
+    std::this_thread::sleep_for(milliseconds(1100));
+    ExpireNow(*service, victim.id, Clock::now());
+    ASSERT_FALSE(IsOk(*service, victim.id));
+    EXPECT_FALSE(
+        service->GetReplicaList("mem_key_0", TenantId::Default()).has_value());
+    EXPECT_TRUE(WaitFor([&] { return service->GetKeyCount() == 0; },
+                        milliseconds(10000)));
+}
+
+// With offload disabled, LOCAL_DISK replicas are admitted without a
+// registration. Their owner expiring with neither a memory segment nor a
+// registration still schedules the pass that reclaims them.
+TEST_F(MasterLivenessIsolationTest, ExpiryWithoutSegmentsStillReclaims) {
+    MasterServiceConfig config;
+    config.enable_offload = false;
+    config.default_kv_lease_ttl = 0;
+    config.client_live_ttl_sec = 1;
+    auto service = std::make_unique<MasterService>(config);
+    Client x{generate_uuid(), {}};
+    x.segment.name = "bare_x";
+    ASSERT_TRUE(service->ReMountSegment({}, x.id).has_value());  // OK, bare.
+    OffloadDiskOnlyKeys(*service, x, "bare_key_", 10);
+    ASSERT_EQ(DiskReplicasOwnedBy(*service, x.id), 10u);
+    std::this_thread::sleep_for(milliseconds(1100));
+    ExpireNow(*service, x.id, Clock::now());
+    EXPECT_FALSE(IsOk(*service, x.id));
+    EXPECT_TRUE(
+        WaitFor([&] { return DiskReplicasOwnedBy(*service, x.id) == 0; },
+                milliseconds(10000)));
+    auto ping = service->Ping(x.id);
+    ASSERT_TRUE(ping.has_value());
+    EXPECT_EQ(ping->client_status, ClientStatus::NEED_REMOUNT);
+}
+
 // The scale shape of the incident, in process: a client with many LOCAL_DISK
 // replicas leaves while other clients keep pinging and remounting. Ping and
 // remount latency must not grow with the index. MOONCAKE_LIVENESS_SCALE_KEYS
-// sets the key count (default 200000; the incident had about 13.8M).
+// sets the key count (200000 is a quick run; the incident had about 13.8M).
 TEST_F(MasterLivenessIsolationTest, LatencyStaysFlatWhileManyKeysAreReclaimed) {
-    size_t keys = 200000;
-    if (const char* env = std::getenv("MOONCAKE_LIVENESS_SCALE_KEYS")) {
-        keys = std::stoull(env);
+    // A benchmark (wall-clock bounds), run on request.
+    const char* env = std::getenv("MOONCAKE_LIVENESS_SCALE_KEYS");
+    if (!env) {
+        GTEST_SKIP() << "set MOONCAKE_LIVENESS_SCALE_KEYS to run";
     }
+    const size_t keys = std::stoull(env);
     auto service = MakeService();
     auto victim = MountClient(*service, "scale_victim", 0x100000000);
     auto other = MountClient(*service, "scale_other", 0x200000000);

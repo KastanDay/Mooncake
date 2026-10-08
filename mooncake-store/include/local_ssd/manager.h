@@ -76,20 +76,21 @@ class LocalSsdManager {
         const UUID& client_id, int64_t bytes);
 
     std::optional<Usage> GetUsage(const UUID& client_id) const;
-    // Credits or debits a registration's used bytes. A nonzero `generation`
-    // targets that registration only: bytes of a registration that was since
+    // Credits or debits the registration `generation` names, if it is still
+    // the client's current one: bytes of a registration that was since
     // unregistered (and perhaps re-registered under the same id) go nowhere.
     bool AdjustUsedBytes(const UUID& client_id, int64_t delta,
-                         uint64_t generation = 0);
+                         uint64_t generation);
 
     // Every registration gets a generation, unique for the manager's lifetime
     // and never reused, so a LOCAL_DISK replica can be bound to the
     // registration it was admitted under. 0 is never a generation.
     std::optional<uint64_t> Generation(const UUID& client_id) const;
-    // Whether `generation` is the client's current registration. Generation 0
-    // (a replica that predates generations, e.g. restored) accepts any
-    // current registration. Takes only the registry's shared lock: cheap
-    // enough for the read path, and safe under a metadata shard lock.
+    // Whether `generation` is the client's current registration. Monotone:
+    // once false for a generation, false forever (generations are never
+    // reused, and 0, carried by a replica bound to no registration, is never
+    // current). Takes only the registry's shared lock: cheap enough for the
+    // read path, and safe under a metadata shard lock.
     bool IsCurrentGeneration(const UUID& client_id, uint64_t generation) const;
 
     ErrorCode EnqueueOffload(const UUID& client_id, OffloadTaskItem task,
@@ -104,11 +105,11 @@ class LocalSsdManager {
                                     const TenantId& tenant_id,
                                     std::string_view key);
 
-    // A nonzero `generation` must be the client's current registration: a
-    // task for a replica of an ended registration never reaches the mailbox
-    // of a later one under the same id.
+    // `generation` must be the client's current registration: a task for a
+    // replica of an ended registration never reaches the mailbox of a later
+    // one under the same id.
     ErrorCode EnqueuePromotion(const UUID& client_id, PromotionTaskItem task,
-                               uint64_t generation = 0);
+                               uint64_t generation);
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode> TakePromotions(
         const UUID& client_id, size_t max_items);
     bool RemovePromotion(const UUID& client_id, const TenantId& tenant_id,

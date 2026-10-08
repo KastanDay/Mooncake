@@ -140,8 +140,8 @@ bool LocalSsdManager::IsCurrentGeneration(const UUID& client_id,
                                           uint64_t generation) const {
     std::shared_lock lock(mutex_);
     auto it = clients_.find(client_id);
-    return it != clients_.end() &&
-           (generation == 0 || it->second->generation == generation);
+    return generation != 0 && it != clients_.end() &&
+           it->second->generation == generation;
 }
 
 std::optional<LocalSsdManager::ClientAccess> LocalSsdManager::FindClient(
@@ -220,8 +220,7 @@ std::optional<LocalSsdManager::Usage> LocalSsdManager::GetUsage(
 bool LocalSsdManager::AdjustUsedBytes(const UUID& client_id, int64_t delta,
                                       uint64_t generation) {
     auto client = FindClient(client_id);
-    if (!client ||
-        (generation != 0 && client->record->generation != generation)) {
+    if (!client || client->record->generation != generation) {
         return false;
     }
     client->record->used_bytes.fetch_add(delta, std::memory_order_relaxed);
@@ -311,8 +310,7 @@ ErrorCode LocalSsdManager::EnqueuePromotion(const UUID& client_id,
                                             PromotionTaskItem task,
                                             uint64_t generation) {
     auto client = FindClient(client_id);
-    if (!client ||
-        (generation != 0 && client->record->generation != generation)) {
+    if (!client || client->record->generation != generation) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     return client->record->mailbox.EnqueuePromotion(std::move(task));

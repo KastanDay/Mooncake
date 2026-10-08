@@ -221,8 +221,10 @@ struct LocalDiskReplicaData {
     // (LocalSsdManager::Generation). Master-local, never serialized: a
     // replica is servable only while that registration is current, so one
     // that outlives its registration is garbage from the moment the
-    // registration ends, whenever metadata cleanup reaches it. 0 = unknown
-    // (restored state): any current registration of the owner.
+    // registration ends, whenever metadata cleanup reaches it. 0 = bound to
+    // no registration (never servable): a replica decoded from a snapshot
+    // until the restore binds it, or one replayed from the oplog until its
+    // owner re-registers and re-adopts it.
     uint64_t generation = 0;
 };
 
@@ -472,28 +474,6 @@ class Replica {
         return false;
     }
 
-    /**
-     * @brief Check if a local_disk replica's owner client is still alive.
-     * Used by CleanupStaleHandles to remove replicas belonging to expired
-     * clients. For non-local_disk replicas, always returns false.
-     * @param alive_clients Set of currently alive client IDs.
-     * @return true if this is a local_disk replica whose client is not alive.
-     */
-    [[nodiscard]] bool has_stale_local_disk_client(
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients)
-        const {
-        auto client_id = get_local_disk_client_id();
-        if (client_id.has_value()) {
-            return alive_clients.find(client_id.value()) == alive_clients.end();
-        }
-        return false;
-    }
-
-    /**
-     * @brief Get the client_id for local_disk replicas.
-     * @return The client_id if this is a local_disk replica, std::nullopt
-     * otherwise.
-     */
     // The LOCAL_DISK registration generation this replica is bound to, or
     // nullopt for other replica types.
     [[nodiscard]] std::optional<uint64_t> get_local_disk_generation() const {
@@ -509,6 +489,24 @@ class Replica {
         }
     }
 
+    // Takes `incoming`'s endpoint, size and generation: the owner re-adopted
+    // this replica under its current registration. Both must be LOCAL_DISK
+    // replicas of the same owner.
+    void rebind_local_disk(const Replica& incoming) {
+        auto* disk_data = std::get_if<LocalDiskReplicaData>(&data_);
+        const auto* from = std::get_if<LocalDiskReplicaData>(&incoming.data_);
+        if (disk_data && from && disk_data->client_id == from->client_id) {
+            disk_data->transport_endpoint = from->transport_endpoint;
+            disk_data->object_size = from->object_size;
+            disk_data->generation = from->generation;
+        }
+    }
+
+    /**
+     * @brief Get the client_id for local_disk replicas.
+     * @return The client_id if this is a local_disk replica, std::nullopt
+     * otherwise.
+     */
     [[nodiscard]] std::optional<UUID> get_local_disk_client_id() const {
         if (is_local_disk_replica()) {
             const auto& disk_data = std::get<LocalDiskReplicaData>(data_);

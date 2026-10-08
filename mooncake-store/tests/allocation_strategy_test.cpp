@@ -771,7 +771,8 @@ class SsdPlacementTestState {
         ASSERT_EQ(local_ssd.RegisterClient(client_id, true), ErrorCode::OK);
         ASSERT_TRUE(
             local_ssd.ReportCapacity(client_id, total_capacity).has_value());
-        ASSERT_TRUE(local_ssd.AdjustUsedBytes(client_id, used_bytes));
+        ASSERT_TRUE(local_ssd.AdjustUsedBytes(
+            client_id, used_bytes, local_ssd.Generation(client_id).value()));
     }
 
     void AddSegmentWithoutSsd(const std::string& name, size_t segment_size) {

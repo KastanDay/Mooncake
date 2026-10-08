@@ -130,13 +130,19 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
- * 1. client_mutex_
- * 2. tenant_quota_policy_mutex_
- * 3. snapshot_mutex_
+ * 1. tenant_quota_policy_mutex_
+ * 2. snapshot_mutex_
+ * 3. client_mutex_
  * 4. metadata_shards_[shard_idx_].mutex
  * 5. tenant_quota_recompute_mutex_
  * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
  * 7. soft_pin_deadline_index_ mutex
+ * liveness_mutex_ is a leaf: held only for a lookup or update of the
+ * liveness table, never while waiting for any other lock, so Ping (which
+ * takes nothing else) is answered whatever else is in progress. Nothing
+ * holds client_mutex_ while it waits for snapshot_mutex_: a remount that
+ * did, waiting behind a metadata sweep while every Ping waited on it, once
+ * expired every client of a production Master at once.
  *
  * Strict tenant admission and policy mutation paths that need both
  * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
@@ -1007,16 +1013,14 @@ class MasterService {
     // and nothing it waits on is held across the pass. Callers that already
     // hold snapshot_mutex_ (the synchronous, HA/snapshot paths) pass
     // lock_snapshot_per_batch=false.
-    // retired_owners: owners retired just now, on the synchronous paths
-    // (HA, snapshot, CXL), whose restored (generation 0) LOCAL_DISK replicas
-    // must go too.
-    void ClearInvalidHandles(
-        bool lock_snapshot_per_batch = true,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retired_owners = {});
+    void ClearInvalidHandles(bool lock_snapshot_per_batch = true);
     // Shard walk behind it; removes completed replicas matching is_stale,
     // erasing a key when no valid replica remains. Visits about
     // kStaleHandleBatchKeys keys (whole buckets, at most
-    // kStaleHandleBatchBuckets of them) per shard-lock hold.
+    // kStaleHandleBatchBuckets of them) per shard-lock hold. is_stale must
+    // be monotone (once true for a replica, true forever), so a key the pass
+    // has passed can only become garbage through a later retirement, which
+    // schedules its own pass.
     void ClearStaleHandles(const std::function<bool(const Replica&)>& is_stale,
                            bool lock_snapshot_per_batch);
     static constexpr size_t kStaleHandleBatchKeys = 256;
@@ -1031,6 +1035,12 @@ class MasterService {
     // Whether a LOCAL_DISK replica's registration is still current (true for
     // any other replica type).
     bool IsLocalDiskRegistrationCurrent(const Replica& replica) const;
+    // After a snapshot restore (the SSD registry is decoded before the
+    // metadata): binds every restored LOCAL_DISK replica to its owner's
+    // restored registration and credits its bytes there, exactly as a live
+    // admission would; a replica whose owner has none stays bound to none,
+    // garbage for the first cleanup pass.
+    void BindRestoredLocalDiskReplicas();
     // Takes snapshot_mutex_ exclusively, announcing the wait so the cleanup
     // pass steps aside between batches rather than starving the writer.
     std::unique_lock<std::shared_mutex> LockSnapshotExclusive() const;
@@ -2002,14 +2012,6 @@ class MasterService {
         MetadataShardAccessorRW* shard = nullptr);
 
     // True when client_id currently has a LOCAL_DISK registration.
-    // Momentarily takes the LocalSsdManager registry lock, so callers must not
-    // hold it; call before taking a metadata shard lock. Callers that need the
-    // answer to stay true across a later metadata write must hold
-    // snapshot_mutex_ (shared) across both -- UnmountLocalDiskSegment
-    // deregisters the client under the exclusive lock, so the check and the
-    // write cannot straddle a deregistration.
-    bool HasMountedLocalDiskSegment(const UUID& client_id);
-
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
     auto AllocateAndInsertMetadata(
@@ -2475,10 +2477,9 @@ class MasterService {
 
     // Client related members. Lock order: snapshot_mutex_, then
     // client_mutex_, then liveness_mutex_ (a leaf). Nothing holds
-    // client_mutex_ while it waits for snapshot_mutex_.
+    // client_mutex_ while it waits for snapshot_mutex_. client_mutex_ guards
+    // client_host_id_; a client's status lives in client_liveness_ alone.
     mutable std::shared_mutex client_mutex_;
-    std::unordered_set<UUID, boost::hash<UUID>>
-        ok_client_;  // client with ok status
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
     void ClientMonitorFunc();
     // Expires the candidates still unobserved for a full TTL, revalidated
@@ -2501,11 +2502,14 @@ class MasterService {
     // all.)
     struct ClientLiveness {
         std::chrono::steady_clock::time_point last_seen;
-        bool ok = false;  // Mirrors ok_client_ membership.
+        // Mounted and remounted since it was last expired (or since the
+        // Master started): its Pings answer OK, not NEED_REMOUNT.
+        bool ok = false;
     };
     // Records that the client was seen now; returns whether it is OK.
     bool ObserveClient(const UUID& client_id);
-    void SetClientLivenessOk(const UUID& client_id, bool ok);
+    // Marks the client OK and seen now; returns whether it already was OK.
+    bool MarkClientOk(const UUID& client_id);
     mutable std::mutex liveness_mutex_;
     std::unordered_map<UUID, ClientLiveness, boost::hash<UUID>>
         client_liveness_;
@@ -2903,6 +2907,14 @@ class MasterService {
     // backup.
     bool IsServableLocalDiskReplica(const Replica& replica) const;
     bool HasServableLocalDiskReplica(const ObjectMetadata& metadata) const;
+    // An owner reported, under its current registration, a key it already
+    // holds a LOCAL_DISK replica for. Rebinds that replica to `incoming`'s
+    // registration and returns true if it was bound to another (an ended
+    // one, or none): the caller then credits its bytes there. False for a
+    // duplicate report, or if the key's LOCAL_DISK replica is another
+    // owner's.
+    bool RebindLocalDiskReplica(ObjectMetadata& metadata,
+                                const Replica& incoming);
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**
