@@ -4836,8 +4836,10 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         CleanupStaleHandles(accessor.GetTenantState(), metadata,
                             &accessor.GetShard());
     }
+    // A replica already marked REMOVED (HA: its removal awaits durability)
+    // is going regardless; a new one is added beside it.
     const bool replacing_existing =
-        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+        metadata.HasReplica(&Replica::fn_is_completed_local_disk_replica);
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
@@ -4896,7 +4898,7 @@ bool MasterService::RebindLocalDiskReplica(ObjectMetadata& metadata,
     bool rebound = false;
     metadata.VisitReplicas(
         [&owner](const Replica& rep) {
-            return rep.is_local_disk_replica() &&
+            return rep.is_local_disk_replica() && rep.is_completed() &&
                    rep.get_local_disk_client_id() == owner;
         },
         [&](Replica& rep) {
@@ -7587,7 +7589,8 @@ auto MasterService::NotifyOffloadSuccess(
                         // registration is refused.
                         refused_unmounted = true;
                     } else if (!obj_metadata.HasReplica(
-                                   &Replica::fn_is_local_disk_replica)) {
+                                   &Replica::
+                                       fn_is_completed_local_disk_replica)) {
                         std::vector<Replica> replicas;
                         replicas.emplace_back(std::move(replica));
                         obj_metadata.AddReplicas(std::move(replicas));

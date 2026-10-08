@@ -434,6 +434,11 @@ class Replica {
         return replica.is_local_disk_replica();
     }
 
+    [[nodiscard]] static bool fn_is_completed_local_disk_replica(
+        const Replica& replica) {
+        return replica.is_local_disk_replica() && replica.is_completed();
+    }
+
     [[nodiscard]] bool is_dfs_replica() const {
         return std::holds_alternative<DfsReplicaData>(data_);
     }

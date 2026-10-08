@@ -753,8 +753,13 @@ TEST_F(MasterLivenessIsolationTest, AdmissionRacingRetirementIsRefused) {
         holding.get_future().wait();
         auto admission = std::async(std::launch::async,
                                     [&] { return Offload(*service, a, key); });
-        // Into its wait for the shard lock, past the generation it binds.
-        std::this_thread::sleep_for(milliseconds(200));
+        // Into its wait for the shard lock, past the generation it binds
+        // (taken before the shard lock): still waiting when the registration
+        // ends, so the refusal is the shard-held re-check's.
+        std::this_thread::sleep_for(milliseconds(500));
+        ASSERT_EQ(admission.wait_for(milliseconds(0)),
+                  std::future_status::timeout)
+            << key;
         RetireDiskAsExpiryDoes(*service, a.id);
         release.set_value();
         holder.join();
@@ -845,6 +850,25 @@ TEST_F(MasterLivenessIsolationTest, ReadoptionRebindsInPlace) {
     EXPECT_FALSE(Rebind(*service, "rebind_key", incoming)) << "duplicate";
     ReclaimNow(*service);
     EXPECT_EQ(DiskReplicasOwnedBy(*service, a.id), 1u);
+}
+
+// A replica already marked REMOVED (HA: its removal awaits durability) is
+// not rebound: the re-adoption is added beside it instead.
+TEST_F(MasterLivenessIsolationTest, ReadoptionDoesNotReviveARemovedReplica) {
+    auto service = MakeService();
+    auto a = MountClient(*service, "removed_a", 0x100000000);
+    PutAndOffload(*service, a, "removed_key", 64);
+    RetireDiskWithoutCleanup(*service, a.id);
+    ASSERT_TRUE(service->MountLocalDiskSegment(a.id, true).has_value());
+    WithDiskReplica(*service, "removed_key", a.id,
+                    [](Replica& r, auto&) { r.mark_removed(); });
+    Replica incoming(a.id, 64, a.segment.name, ReplicaStatus::COMPLETE);
+    incoming.set_local_disk_generation(Generation(*service, a.id));
+    EXPECT_FALSE(Rebind(*service, "removed_key", incoming));
+    size_t completed = 0;
+    WithDiskReplica(*service, "removed_key", a.id,
+                    [&](Replica& r, auto&) { completed += r.is_completed(); });
+    EXPECT_EQ(completed, 0u) << "a REMOVED replica was rebound";
 }
 
 // A promotion pushed for a source of an ended registration finds no

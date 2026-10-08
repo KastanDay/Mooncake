@@ -2908,11 +2908,12 @@ class MasterService {
     bool IsServableLocalDiskReplica(const Replica& replica) const;
     bool HasServableLocalDiskReplica(const ObjectMetadata& metadata) const;
     // An owner reported, under its current registration, a key it already
-    // holds a LOCAL_DISK replica for. Rebinds that replica to `incoming`'s
-    // registration and returns true if it was bound to another (an ended
-    // one, or none): the caller then credits its bytes there. False for a
-    // duplicate report, or if the key's LOCAL_DISK replica is another
-    // owner's.
+    // holds a completed LOCAL_DISK replica for. Rebinds that replica to
+    // `incoming`'s registration and returns true if it was bound to another
+    // (an ended one, or none): the caller then credits its bytes there.
+    // False for a duplicate report, and for a key whose LOCAL_DISK replica
+    // is another owner's: that report is dropped (nothing added, nothing
+    // credited), one LOCAL_DISK replica per key as before.
     bool RebindLocalDiskReplica(ObjectMetadata& metadata,
                                 const Replica& incoming);
     bool IsEvictableMemoryReplica(const Replica& replica) const;
