@@ -73,6 +73,7 @@ add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
+add_store_test(master_liveness_isolation_test master_liveness_isolation_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
 add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
 add_store_test(dynamic_replication_test dynamic_replication_test.cpp)

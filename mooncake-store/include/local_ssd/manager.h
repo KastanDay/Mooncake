@@ -76,7 +76,21 @@ class LocalSsdManager {
         const UUID& client_id, int64_t bytes);
 
     std::optional<Usage> GetUsage(const UUID& client_id) const;
-    bool AdjustUsedBytes(const UUID& client_id, int64_t delta);
+    // Credits or debits a registration's used bytes. A nonzero `generation`
+    // targets that registration only: bytes of a registration that was since
+    // unregistered (and perhaps re-registered under the same id) go nowhere.
+    bool AdjustUsedBytes(const UUID& client_id, int64_t delta,
+                         uint64_t generation = 0);
+
+    // Every registration gets a generation, unique for the manager's lifetime
+    // and never reused, so a LOCAL_DISK replica can be bound to the
+    // registration it was admitted under. 0 is never a generation.
+    std::optional<uint64_t> Generation(const UUID& client_id) const;
+    // Whether `generation` is the client's current registration. Generation 0
+    // (a replica that predates generations, e.g. restored) accepts any
+    // current registration. Takes only the registry's shared lock: cheap
+    // enough for the read path, and safe under a metadata shard lock.
+    bool IsCurrentGeneration(const UUID& client_id, uint64_t generation) const;
 
     ErrorCode EnqueueOffload(const UUID& client_id, OffloadTaskItem task,
                              size_t limit);
@@ -108,8 +122,10 @@ class LocalSsdManager {
 
    private:
     struct ClientRecord {
-        explicit ClientRecord(bool enable_offloading)
-            : mailbox(enable_offloading) {}
+        ClientRecord(bool enable_offloading, uint64_t generation)
+            : generation(generation), mailbox(enable_offloading) {}
+
+        const uint64_t generation;
 
         // Unregistration removes the record from clients_ first, then takes
         // this lock exclusively to wait for operations that already found it.
@@ -144,6 +160,7 @@ class LocalSsdManager {
 
     mutable std::shared_mutex mutex_;
     ClientMap clients_;
+    std::atomic<uint64_t> next_generation_{1};
 };
 
 }  // namespace mooncake

@@ -121,8 +121,27 @@ ErrorCode LocalSsdManager::RegisterClient(const UUID& client_id,
         return ErrorCode::SEGMENT_ALREADY_EXISTS;
     }
     clients_.emplace(client_id,
-                     std::make_shared<ClientRecord>(enable_offloading));
+                     std::make_shared<ClientRecord>(
+                         enable_offloading, next_generation_.fetch_add(1)));
     return ErrorCode::OK;
+}
+
+std::optional<uint64_t> LocalSsdManager::Generation(
+    const UUID& client_id) const {
+    std::shared_lock lock(mutex_);
+    auto it = clients_.find(client_id);
+    if (it == clients_.end()) {
+        return std::nullopt;
+    }
+    return it->second->generation;
+}
+
+bool LocalSsdManager::IsCurrentGeneration(const UUID& client_id,
+                                          uint64_t generation) const {
+    std::shared_lock lock(mutex_);
+    auto it = clients_.find(client_id);
+    return it != clients_.end() &&
+           (generation == 0 || it->second->generation == generation);
 }
 
 std::optional<LocalSsdManager::ClientAccess> LocalSsdManager::FindClient(
@@ -198,9 +217,11 @@ std::optional<LocalSsdManager::Usage> LocalSsdManager::GetUsage(
                  record.used_bytes.load(std::memory_order_relaxed)};
 }
 
-bool LocalSsdManager::AdjustUsedBytes(const UUID& client_id, int64_t delta) {
+bool LocalSsdManager::AdjustUsedBytes(const UUID& client_id, int64_t delta,
+                                      uint64_t generation) {
     auto client = FindClient(client_id);
-    if (!client) {
+    if (!client ||
+        (generation != 0 && client->record->generation != generation)) {
         return false;
     }
     client->record->used_bytes.fetch_add(delta, std::memory_order_relaxed);
@@ -366,8 +387,8 @@ LocalSsdPersistedState LocalSsdManager::ExportPersistedState() const {
 void LocalSsdManager::RestorePersistedState(LocalSsdPersistedState state) {
     ClientMap clients;
     for (auto& [client_id, persisted] : state) {
-        auto record =
-            std::make_shared<ClientRecord>(persisted.enable_offloading);
+        auto record = std::make_shared<ClientRecord>(
+            persisted.enable_offloading, next_generation_.fetch_add(1));
         record->total_capacity_bytes = persisted.total_capacity_bytes;
         record->mailbox.pending_offloads_.insert(
             std::make_move_iterator(persisted.pending_offloads.begin()),

@@ -1129,7 +1129,8 @@ class LocalDiskUnmountInterleavingTest : public MasterServiceSSDTest {
     }
 
     static void SweepHalf(MasterService& service, const UUID& client_id) {
-        service.ClearLocalDiskHandlesOwnedBy(client_id);
+        (void)client_id;  // The cleanup reclaims every ended registration.
+        service.ClearInvalidHandles();
     }
 };
 
@@ -1149,11 +1150,10 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     DeregisterHalf(*service, leaving);
 
     // The interleaving under test: another store mounts and registers a
-    // replica before the sweep reaches its shard. Whether the client monitor
-    // has admitted `late` to the alive set yet does not matter to an
-    // owner-targeted sweep -- while a liveness-complement sweep taken before
-    // this mount would classify the replica stale and erase it, and with it
-    // the key, since this disk replica is the key's only one.
+    // replica before the sweep reaches its shard. The sweep classifies each
+    // replica by its own registration (is that generation still current?),
+    // not by a liveness set taken before this mount, so `late`'s replica
+    // survives -- and with it the key, whose only replica it is.
     MountMemoryAndLocalDisk(*service, late, late_segment, 0x1400000000);
     StorageObjectMetadata late_metadata;
     late_metadata.data_size = 1024;

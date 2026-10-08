@@ -217,6 +217,13 @@ struct LocalDiskReplicaData {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
+    // The owner's LOCAL_DISK registration this replica was admitted under
+    // (LocalSsdManager::Generation). Master-local, never serialized: a
+    // replica is servable only while that registration is current, so one
+    // that outlives its registration is garbage from the moment the
+    // registration ends, whenever metadata cleanup reaches it. 0 = unknown
+    // (restored state): any current registration of the owner.
+    uint64_t generation = 0;
 };
 
 struct DistributedFSDescriptor {
@@ -487,6 +494,21 @@ class Replica {
      * @return The client_id if this is a local_disk replica, std::nullopt
      * otherwise.
      */
+    // The LOCAL_DISK registration generation this replica is bound to, or
+    // nullopt for other replica types.
+    [[nodiscard]] std::optional<uint64_t> get_local_disk_generation() const {
+        if (const auto* disk_data = std::get_if<LocalDiskReplicaData>(&data_)) {
+            return disk_data->generation;
+        }
+        return std::nullopt;
+    }
+
+    void set_local_disk_generation(uint64_t generation) {
+        if (auto* disk_data = std::get_if<LocalDiskReplicaData>(&data_)) {
+            disk_data->generation = generation;
+        }
+    }
+
     [[nodiscard]] std::optional<UUID> get_local_disk_client_id() const {
         if (is_local_disk_replica()) {
             const auto& disk_data = std::get<LocalDiskReplicaData>(data_);

@@ -100,6 +100,9 @@ class MasterServiceProcessingKeyDoubleEraseTest;
 // with a competing mount + register serialized between them, pinning the
 // interleaving instead of hoping a thread scheduler produces it.
 class LocalDiskUnmountInterleavingTest;
+// Liveness isolated from metadata cleanup: holds the master's locks directly
+// to pin the interleavings (pass, remount, Ping) of the 2026-10-08 incident.
+class MasterLivenessIsolationTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -157,6 +160,7 @@ class MasterService {
     // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
     friend class test::MasterServiceProcessingKeyDoubleEraseTest;
     friend class test::LocalDiskUnmountInterleavingTest;
+    friend class test::MasterLivenessIsolationTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
@@ -711,9 +715,8 @@ class MasterService {
     /**
      * @brief Heartbeat from client
      * @param client_id The uuid of the client
-     * @return PingResponse containing view version and client status
-     * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if the client
-     *         ping queue is full
+     * @return PingResponse containing view version and client status. Takes
+     *         only a leaf lock, so a Ping is never held up by metadata work.
      */
     auto Ping(const UUID& client_id) -> tl::expected<PingResponse, ErrorCode>;
 
@@ -742,22 +745,25 @@ class MasterService {
      * @brief Deregisters a client's file storage segment from the master. This
      * function is idempotent.
      *
-     * Drops the client's LOCAL_DISK registration and then its LOCAL_DISK
-     * replicas -- the outcome the client-expiry branch of ClientMonitorFunc
-     * reaches after one client_ttl. Exposing it as an operation lets a store
-     * that is shutting down deregister while it can still serve, instead of
-     * leaving the master advertising it as an owner until the TTL elapses.
-     * Object metadata whose last replica was on that disk is erased, exactly
-     * as on expiry; a store that comes back re-adopts its files through the
-     * MountLocalDiskSegment/NotifyOffloadSuccess path, which recreates them.
+     * Retires the client's LOCAL_DISK registration -- the outcome the
+     * client-expiry branch of ClientMonitorFunc reaches after one client_ttl.
+     * Exposing it as an operation lets a store that is shutting down
+     * deregister while it can still serve, instead of leaving the master
+     * advertising it as an owner until the TTL elapses. From the return on,
+     * no reader is given one of its LOCAL_DISK replicas (each is bound to the
+     * registration generation it was admitted under, and that generation is
+     * no longer current); their metadata, and objects whose last replica was
+     * on that disk, are reclaimed by the cleanup worker in bounded batches,
+     * not by this call. A store that comes back re-adopts its files through
+     * the MountLocalDiskSegment/NotifyOffloadSuccess path, under a new
+     * generation.
      *
-     * The replica sweep targets exactly this owner (see
-     * ClearLocalDiskHandlesOwnedBy), and the deregistration runs under the
-     * exclusive snapshot_mutex_ so no registration admitted against the old
-     * one can land after the sweep: NotifyOffloadSuccess checks the
-     * registration and writes the replica inside one shared-lock section,
-     * which therefore falls entirely before the deregistration (registered,
-     * then swept) or entirely after (refused with SEGMENT_NOT_FOUND).
+     * The retirement runs under the exclusive snapshot_mutex_ so no replica
+     * admitted against the old registration can be bound to the new one:
+     * NotifyOffloadSuccess checks the registration and writes the replica
+     * inside one shared-lock section, which therefore falls entirely before
+     * the retirement (bound to the old generation, so garbage) or entirely
+     * after (refused with SEGMENT_NOT_FOUND).
      */
     auto UnmountLocalDiskSegment(const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
@@ -994,20 +1000,37 @@ class MasterService {
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
-    void ClearInvalidHandles();
-    // Caller owns snapshot_mutex_ (shared) while metadata is swept.
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
-    // Clear completed LOCAL_DISK replicas owned by exactly this client, in
-    // all shards. Owner-targeted on purpose: a liveness-complement sweep
-    // classifies by absence from a point-in-time set, so an owner that
-    // mounts and registers between taking that set and the sweep reaching
-    // its shard would be swept as stale. A predicate on the owner id cannot
-    // misclassify a concurrent mount, whatever the interleaving.
-    void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
-    // Shard walk shared by the two sweeps above; removes completed replicas
-    // matching is_stale, erasing a key when no valid replica remains.
-    void ClearStaleHandles(const std::function<bool(const Replica&)>& is_stale);
+    // Reclaims every replica that is garbage (IsReplicaReclaimable) in one
+    // bounded pass over all shards: replica_cleanup_worker_'s job. Takes
+    // snapshot_mutex_ (shared) and one shard lock per batch only, so a
+    // client mounting, remounting or unmounting waits for at most one batch,
+    // and nothing it waits on is held across the pass. Callers that already
+    // hold snapshot_mutex_ (the synchronous, HA/snapshot paths) pass
+    // lock_snapshot_per_batch=false.
+    void ClearInvalidHandles(bool lock_snapshot_per_batch = true);
+    // Shard walk behind it; removes completed replicas matching is_stale,
+    // erasing a key when no valid replica remains. Visits at most
+    // kStaleHandleBatchKeys keys per shard-lock hold.
+    void ClearStaleHandles(const std::function<bool(const Replica&)>& is_stale,
+                           bool lock_snapshot_per_batch);
+    static constexpr size_t kStaleHandleBatchKeys = 256;
+
+    // A replica no reader may be given any more, whose metadata is garbage:
+    // completed, and on an unmounted memory or NoF segment, or on a LOCAL_DISK
+    // registration that is no longer current. O(1), and needs no lock beyond
+    // the caller's shard lock (the LOCAL_DISK check takes only the SSD
+    // registry's shared lock, which is always acquired after shard locks).
+    bool IsReplicaReclaimable(const Replica& replica) const;
+    // Whether a LOCAL_DISK replica's registration is still current (true for
+    // any other replica type).
+    bool IsLocalDiskRegistrationCurrent(const Replica& replica) const;
+    // Schedules replica_cleanup_worker_ when segments may be reclaimed in the
+    // background, otherwise sweeps now (the caller must not hold
+    // snapshot_mutex_ then).
+    void RequestStaleHandleCleanup();
+    // Takes snapshot_mutex_ exclusively, announcing the wait so the cleanup
+    // pass steps aside between batches rather than starving the writer.
+    std::unique_lock<std::shared_mutex> LockSnapshotExclusive() const;
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -1932,9 +1955,12 @@ class MasterService {
         std::vector<Replica::Descriptor> remaining;
         bool would_invalidate{false};
     };
+    // The surviving descriptors (plan.remaining) are only needed to persist
+    // the cleanup to the HA oplog, and building one asks every surviving
+    // memory replica's allocator for its endpoint: they are built only when
+    // the oplog is enabled.
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
-        const ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) const;
+        const ObjectMetadata& metadata) const;
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale) const;
@@ -1959,15 +1985,14 @@ class MasterService {
     auto ResolveSoftPinRequest(const ReplicateConfig& config) const
         -> tl::expected<ResolvedSoftPinRequest, ErrorCode>;
 
-    // Helper to clean up stale handles pointing to unmounted segments
-    // or local_disk replicas whose owner client is no longer alive.
-    bool CleanupStaleHandles(
-        TenantState& tenant_state, ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
-        MetadataShardAccessorRW* shard = nullptr);
-    // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
-    // accounting (quota release, promotion-task cancellation, disk-replica
-    // shard bookkeeping) instead of duplicating it.
+    // Helper to clean up the reclaimable replicas of one object
+    // (IsReplicaReclaimable). Returns true if no valid replica remains.
+    bool CleanupStaleHandles(TenantState& tenant_state,
+                             ObjectMetadata& metadata,
+                             MetadataShardAccessorRW* shard = nullptr);
+    // Predicate form, shared by the batched pass so every removal goes
+    // through the same accounting (quota release, promotion-task
+    // cancellation, disk-replica shard bookkeeping).
     bool CleanupStaleHandles(
         TenantState& tenant_state, ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale,
@@ -2170,10 +2195,9 @@ class MasterService {
                 service_->GetBoundTenantQuotaHandle(*tenant_state_);
             }
             // Automatically clean up invalid handles (memory replicas only).
-            // Note: We only check memory replicas here to avoid lock order
-            // violation (client_mutex_ must be acquired before metadata shard).
-            // local_disk replicas are cleaned up by ClearInvalidHandles() in
-            // ClientMonitorFunc.
+            // local_disk replicas of ended registrations are unreadable
+            // (IsReplicaReadable) and reclaimed by the cleanup worker
+            // (ClearInvalidHandles), or before a new disk replica is added.
             if (!(service_->enable_ha_ && service_->enable_oplog_) &&
                 tenant_state_ != nullptr &&
                 it_ != tenant_state_->metadata.end()) {
@@ -2446,24 +2470,42 @@ class MasterService {
 
     ViewVersionId view_version_;
 
-    // Client related members
+    // Client related members. Lock order: snapshot_mutex_, then
+    // client_mutex_, then liveness_mutex_ (a leaf). Nothing holds
+    // client_mutex_ while it waits for snapshot_mutex_.
     mutable std::shared_mutex client_mutex_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
     void ClientMonitorFunc();
+    // Expires the candidates still unobserved for a full TTL, revalidated
+    // under the locks: unmounts their memory segments, retires their
+    // LOCAL_DISK registrations, and schedules the metadata cleanup. Never
+    // sweeps metadata itself.
+    void ExpireClients(const std::vector<UUID>& candidates,
+                       std::chrono::steady_clock::time_point now);
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
-    // boost lockfree queue requires trivial assignment operator
-    struct PodUUID {
-        uint64_t first;
-        uint64_t second;
+
+    // Client liveness, recorded by Ping itself. liveness_mutex_ is a leaf:
+    // it is only ever held for a map lookup or update, never while waiting
+    // for another lock, so a Ping is recorded whatever metadata work,
+    // remount or cleanup is in progress. (A Ping that had to wait for
+    // client_mutex_ behind a remount, itself waiting for snapshot_mutex_
+    // behind a metadata sweep, is how one expired client once expired them
+    // all.)
+    struct ClientLiveness {
+        std::chrono::steady_clock::time_point last_seen;
+        bool ok = false;  // Mirrors ok_client_ membership.
     };
-    static constexpr size_t kClientPingQueueSize =
-        128 * 1024;  // Size of the client ping queue
-    boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
+    // Records that the client was seen now; returns whether it is OK.
+    bool ObserveClient(const UUID& client_id);
+    void SetClientLivenessOk(const UUID& client_id, bool ok);
+    mutable std::mutex liveness_mutex_;
+    std::unordered_map<UUID, ClientLiveness, boost::hash<UUID>>
+        client_liveness_;
     const int64_t client_live_ttl_sec_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
@@ -2690,6 +2732,7 @@ class MasterService {
     std::unique_ptr<MasterSnapshotRepository> snapshot_repository_;
     std::unique_ptr<ha::MasterSnapshotCodec> snapshot_codec_;
     mutable std::shared_mutex snapshot_mutex_;
+    mutable std::atomic<int> snapshot_writers_waiting_{0};
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;

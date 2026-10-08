@@ -12,6 +12,8 @@
 #include <cstring>
 #include <future>
 #include <limits>
+#include <map>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <sstream>
@@ -891,16 +893,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         // this segment, when trying to push id to the queue, the queue is
         // already full. However, at this point, the message must be sent,
         // otherwise this client cannot be monitored and expired.
-        {
-            PodUUID pod_client_id;
-            pod_client_id.first = client_id.first;
-            pod_client_id.second = client_id.second;
-            if (!client_ping_queue_.push(pod_client_id)) {
-                LOG(ERROR) << "segment_name=" << segment.name
-                           << ", error=client_ping_queue_full";
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-        }
+        ObserveClient(client_id);
 
         LOG(INFO) << "client_id=" << client_id
                   << ", action=mount_segment, segment_name=" << segment.name;
@@ -986,8 +979,10 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     {
+        // snapshot_mutex_ first (the global lock order), so this never holds
+        // client_mutex_ while it waits for a metadata pass to finish.
+        auto snapshot_lock = LockSnapshotExclusive();
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
-        std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
                 client_host_id_[client_id] = segment.host_id;
@@ -1077,14 +1072,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             // the queue is already full. However, at this point, the message
             // must be sent, otherwise this client cannot be monitored and
             // expired.
-            PodUUID pod_client_id;
-            pod_client_id.first = client_id.first;
-            pod_client_id.second = client_id.second;
-            if (!client_ping_queue_.push(pod_client_id)) {
-                LOG(ERROR) << "client_id=" << client_id
-                           << ", error=client_ping_queue_full";
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
+            ObserveClient(client_id);
 
             remount_error = segment_access.ReMountSegment(segments, client_id);
             if (remount_error == ErrorCode::OK) {
@@ -1263,6 +1251,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 
         // Change the client status to OK
         ok_client_.insert(client_id);
+        SetClientLivenessOk(client_id, true);
         MasterMetricManager::instance().inc_active_clients();
     }
 
@@ -2014,15 +2003,11 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
 
 MasterService::StaleHandleCleanupPlan
 MasterService::BuildStaleHandleCleanupPlan(
-    const ObjectMetadata& metadata,
-    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) const {
-    return BuildStaleHandleCleanupPlan(
-        metadata, [&alive_clients](const Replica& replica) {
-            return (replica.has_invalid_mem_handle() ||
-                    replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(alive_clients)) &&
-                   replica.is_completed();
-        });
+    const ObjectMetadata& metadata) const {
+    return BuildStaleHandleCleanupPlan(metadata,
+                                       [this](const Replica& replica) {
+                                           return IsReplicaReclaimable(replica);
+                                       });
 }
 
 MasterService::StaleHandleCleanupPlan
@@ -2036,7 +2021,7 @@ MasterService::BuildStaleHandleCleanupPlan(
             plan.removed_ids.push_back(replica.id());
             continue;
         }
-        if (replica.status() == ReplicaStatus::COMPLETE) {
+        if (enable_oplog_ && replica.status() == ReplicaStatus::COMPLETE) {
             plan.remaining.push_back(replica.get_descriptor());
         }
         if (!replica.is_memory_replica() || !replica.has_invalid_mem_handle()) {
@@ -2198,7 +2183,10 @@ MasterService::EraseMetadata(
 
 void MasterService::ReleaseLocalDiskUsage(
     const std::vector<Replica>& replicas) {
-    std::unordered_map<UUID, int64_t, boost::hash<UUID>> bytes_by_client;
+    // Keyed by registration, not just owner: bytes of a registration that
+    // ended (and maybe re-registered under the same id) must not be debited
+    // from the new one.
+    std::map<std::pair<UUID, uint64_t>, int64_t> bytes_by_registration;
     for (const auto& replica : replicas) {
         if (!replica.is_local_disk_replica()) {
             continue;
@@ -2206,15 +2194,15 @@ void MasterService::ReleaseLocalDiskUsage(
         const auto descriptor =
             replica.get_descriptor().get_local_disk_descriptor();
         if (descriptor.object_size > 0) {
-            bytes_by_client[descriptor.client_id] += descriptor.object_size;
+            bytes_by_registration[{
+                descriptor.client_id,
+                replica.get_local_disk_generation().value_or(0)}] +=
+                descriptor.object_size;
         }
     }
-    if (bytes_by_client.empty()) {
-        return;
-    }
-
-    for (const auto& [client_id, bytes] : bytes_by_client) {
-        local_ssd_manager_.AdjustUsedBytes(client_id, -bytes);
+    for (const auto& [registration, bytes] : bytes_by_registration) {
+        local_ssd_manager_.AdjustUsedBytes(registration.first, -bytes,
+                                           registration.second);
     }
 }
 
@@ -2494,101 +2482,186 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
     }
 }
 
-void MasterService::ClearInvalidHandles() {
-    std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
-    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-    auto alive_clients = ok_client_;
-    client_lock.unlock();
-    ClearInvalidHandles(alive_clients);
+void MasterService::ClearInvalidHandles(bool lock_snapshot_per_batch) {
+    ClearStaleHandles(
+        [this](const Replica& replica) {
+            return IsReplicaReclaimable(replica);
+        },
+        lock_snapshot_per_batch);
 }
 
-void MasterService::ClearInvalidHandles(
-    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
-    ClearStaleHandles([&alive_clients](const Replica& replica) {
-        return (replica.has_invalid_mem_handle() ||
-                replica.has_invalid_nof_handle() ||
-                replica.has_stale_local_disk_client(alive_clients)) &&
-               replica.is_completed();
-    });
+bool MasterService::IsLocalDiskRegistrationCurrent(
+    const Replica& replica) const {
+    const auto owner = replica.get_local_disk_client_id();
+    // Without offload there is no registry to check against (and no mount or
+    // unmount to race): the same scope as the admission checks.
+    if (!owner || !enable_offload_) {
+        return true;
+    }
+    return local_ssd_manager_.IsCurrentGeneration(
+        *owner, replica.get_local_disk_generation().value_or(0));
 }
 
-void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
-    ClearStaleHandles([&owner](const Replica& replica) {
-        return replica.is_local_disk_replica() && replica.is_completed() &&
-               replica.get_local_disk_client_id() == owner;
-    });
+bool MasterService::IsReplicaReclaimable(const Replica& replica) const {
+    return replica.is_completed() &&
+           (replica.has_invalid_mem_handle() ||
+            replica.has_invalid_nof_handle() ||
+            (replica.is_local_disk_replica() &&
+             !IsLocalDiskRegistrationCurrent(replica)));
+}
+
+void MasterService::RequestStaleHandleCleanup() {
+    if (enable_async_segment_cleanup_) {
+        replica_cleanup_worker_.Schedule();
+    } else {
+        ClearInvalidHandles();
+    }
+}
+
+std::unique_lock<std::shared_mutex> MasterService::LockSnapshotExclusive()
+    const {
+    // Announced while waiting, so the cleanup pass, which re-takes the lock
+    // shared for every batch, steps aside instead of starving the writer.
+    snapshot_writers_waiting_.fetch_add(1, std::memory_order_acq_rel);
+    std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
+    snapshot_writers_waiting_.fetch_sub(1, std::memory_order_acq_rel);
+    return lock;
 }
 
 void MasterService::ClearStaleHandles(
-    const std::function<bool(const Replica&)>& is_stale) {
-    for (size_t i = 0; i < kNumShards; i++) {
-        MetadataShardAccessorRW shard(this, i);
-        for (auto tenant_it = shard->tenants.begin();
-             tenant_it != shard->tenants.end();) {
-            auto& tenant_state = tenant_it->second;
-            auto it = tenant_state.metadata.begin();
-            while (it != tenant_state.metadata.end()) {
-                const auto cleanup_plan =
-                    BuildStaleHandleCleanupPlan(it->second, is_stale);
-                if (!cleanup_plan.removed_ids.empty()) {
-                    if (enable_ha_) {
-                        if (enable_oplog_) {
-                            auto persist_result =
-                                PersistStaleHandleCleanupForHA(
-                                    "ClearStaleHandles", tenant_it->first,
-                                    it->first, it->second, cleanup_plan);
-                            if (!persist_result) {
-                                ++it;
-                                continue;
-                            }
-                            ++it;
-                            continue;
-                        }
-                    }
-                    if (CleanupStaleHandles(tenant_state, it->second, is_stale,
-                                            &shard)) {
-                        it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                           QuotaEraseMode::kFull, &shard);
-                    } else {
-                        ++it;
-                    }
-                } else if (!it->second.IsValid()) {
-                    if (enable_ha_) {
-                        if (enable_oplog_) {
-                            auto persist_result =
-                                AppendOpLogWithDurableFinalize(
-                                    OpType::REMOVE, tenant_it->first.value(),
-                                    it->first, {},
-                                    [this](const OpLogEntry& durable_entry) {
-                                        FinalizeMetadataEraseAfterDurable(
-                                            durable_entry,
-                                            QuotaEraseMode::kFull);
-                                    });
-                            if (!persist_result) {
-                                LOG(WARNING)
-                                    << "ClearStaleHandles(last replica)"
-                                    << ": REMOVE persist failed for key="
-                                    << it->first << ", err="
-                                    << static_cast<int>(persist_result.error());
-                                ++it;
-                                continue;
-                            }
-                            ++it;
-                            continue;
-                        }
-                    }
-                    it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                       QuotaEraseMode::kFull, &shard);
-                } else {
-                    ++it;
-                }
+    const std::function<bool(const Replica&)>& is_stale,
+    bool lock_snapshot_per_batch) {
+    using MetadataMap = std::unordered_map<std::string, ObjectMetadata>;
+    // Reclaims one entry exactly as an unbatched walk would; may erase it.
+    auto reclaim = [&](MetadataShardAccessorRW& shard,
+                       const TenantId& tenant_id, TenantState& tenant_state,
+                       MetadataMap::iterator it) {
+        const auto cleanup_plan =
+            BuildStaleHandleCleanupPlan(it->second, is_stale);
+        if (!cleanup_plan.removed_ids.empty()) {
+            if (enable_ha_ && enable_oplog_) {
+                auto persist_result = PersistStaleHandleCleanupForHA(
+                    "ClearStaleHandles", tenant_id, it->first, it->second,
+                    cleanup_plan);
+                (void)persist_result;  // Finalized (or retried) after durable.
+                return;
             }
-            if (tenant_state.Empty()) {
-                tenant_it = shard->tenants.erase(tenant_it);
-            } else {
-                ++tenant_it;
+            if (CleanupStaleHandles(tenant_state, it->second, is_stale,
+                                    &shard)) {
+                EraseMetadata(tenant_state, it, tenant_id,
+                              QuotaEraseMode::kFull, &shard);
+            }
+        } else if (!it->second.IsValid()) {
+            if (enable_ha_ && enable_oplog_) {
+                auto persist_result = AppendOpLogWithDurableFinalize(
+                    OpType::REMOVE, tenant_id.value(), it->first, {},
+                    [this](const OpLogEntry& durable_entry) {
+                        FinalizeMetadataEraseAfterDurable(
+                            durable_entry, QuotaEraseMode::kFull);
+                    });
+                if (!persist_result) {
+                    LOG(WARNING)
+                        << "ClearStaleHandles(last replica)"
+                        << ": REMOVE persist failed for key=" << it->first
+                        << ", err=" << static_cast<int>(persist_result.error());
+                }
+                return;
+            }
+            EraseMetadata(tenant_state, it, tenant_id, QuotaEraseMode::kFull,
+                          &shard);
+        }
+    };
+
+    const auto started = std::chrono::steady_clock::now();
+    size_t visited_total = 0;
+    size_t reclaimed_keys = 0;
+    for (size_t i = 0; i < kNumShards; i++) {
+        std::vector<TenantId> tenant_ids;
+        {
+            std::optional<std::shared_lock<std::shared_mutex>> snapshot_lock;
+            if (lock_snapshot_per_batch) {
+                snapshot_lock.emplace(snapshot_mutex_);
+            }
+            MetadataShardAccessorRW shard(this, i);
+            tenant_ids.reserve(shard->tenants.size());
+            for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+                tenant_ids.push_back(tenant_id);
             }
         }
+        for (const auto& tenant_id : tenant_ids) {
+            // A bucket cursor over the tenant's map: whole buckets per batch,
+            // so no position inside a bucket has to survive an unlock.
+            // Erasing never rehashes. A rehash (growth only, geometric, so
+            // rare) moves keys between buckets: the tenant then starts over,
+            // so no key is skipped; reclaiming is idempotent.
+            size_t bucket = 0;
+            size_t bucket_count = 0;
+            bool done = false;
+            while (!done) {
+                if (lock_snapshot_per_batch) {
+                    while (snapshot_writers_waiting_.load(
+                               std::memory_order_acquire) > 0) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(1));
+                    }
+                }
+                std::optional<std::shared_lock<std::shared_mutex>>
+                    snapshot_lock;
+                if (lock_snapshot_per_batch) {
+                    snapshot_lock.emplace(snapshot_mutex_);
+                }
+                MetadataShardAccessorRW shard(this, i);
+                auto tenant_it = shard->tenants.find(tenant_id);
+                if (tenant_it == shard->tenants.end()) {
+                    break;
+                }
+                auto& tenant_state = tenant_it->second;
+                auto& metadata = tenant_state.metadata;
+                if (metadata.bucket_count() != bucket_count) {
+                    bucket = 0;
+                    bucket_count = metadata.bucket_count();
+                }
+                size_t visited = 0;
+                std::vector<std::string> stale_keys;
+                while (bucket < bucket_count &&
+                       visited < kStaleHandleBatchKeys) {
+                    stale_keys.clear();
+                    for (auto lit = metadata.cbegin(bucket);
+                         lit != metadata.cend(bucket); ++lit) {
+                        ++visited;
+                        if (!lit->second.IsValid() ||
+                            lit->second.HasReplica(is_stale)) {
+                            stale_keys.push_back(lit->first);
+                        }
+                    }
+                    ++bucket;
+                    for (const auto& key : stale_keys) {
+                        auto it = metadata.find(key);
+                        if (it != metadata.end()) {
+                            reclaim(shard, tenant_id, tenant_state, it);
+                            ++reclaimed_keys;
+                        }
+                    }
+                }
+                visited_total += visited;
+                done = bucket >= bucket_count;
+                if (done && tenant_state.Empty()) {
+                    shard->tenants.erase(tenant_it);
+                }
+            }
+        }
+    }
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count();
+    if (reclaimed_keys > 0) {
+        LOG(INFO) << "action=reclaim_stale_handles, keys_visited="
+                  << visited_total << ", keys_reclaimed=" << reclaimed_keys
+                  << ", elapsed_ms=" << elapsed_ms;
+    } else {
+        VLOG(1) << "action=reclaim_stale_handles, keys_visited="
+                << visited_total << ", elapsed_ms=" << elapsed_ms;
     }
 }
 
@@ -2624,10 +2697,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     -> tl::expected<void, ErrorCode> {
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
-    std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    auto alive_clients = ok_client_;
-    client_lock.unlock();
     // 1. Prepare to unmount the segment by deleting its allocator
     {
         ScopedSegmentAccess segment_access =
@@ -2649,7 +2719,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     if (enable_async_segment_cleanup_) {
         replica_cleanup_worker_.Schedule();
     } else {
-        ClearInvalidHandles(alive_clients);
+        ClearInvalidHandles(/*lock_snapshot_per_batch=*/false);
     }
 
     // Cache endpoint before commit removes segment from registry.
@@ -2686,7 +2756,7 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
                                            const UUID& client_id,
                                            uint64_t grace_period_ms)
     -> tl::expected<void, ErrorCode> {
-    std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
+    auto lock = LockSnapshotExclusive();
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     // Verify ownership: the segment must belong to the calling client
@@ -2730,10 +2800,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
 #else
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
-    std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    auto alive_clients = ok_client_;
-    client_lock.unlock();
 
     // 1. Prepare to unmount the segment by deleting its allocator
     {
@@ -2751,8 +2818,14 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     }  // Release the segment mutex before long-running step 2 and avoid
        // deadlocks
 
-    // 2. Remove the metadata of the related objects
-    ClearInvalidHandles(alive_clients);
+    // 2. Remove the metadata of the related objects. NoF replicas are
+    // unreadable from Prepare on (IsReplicaReadable), so with background
+    // cleanup the sweep need not hold up this unmount.
+    if (enable_async_segment_cleanup_) {
+        replica_cleanup_worker_.Schedule();
+    } else {
+        ClearInvalidHandles(/*lock_snapshot_per_batch=*/false);
+    }
 
     // 3. Commit the unmount operation
     ScopedNoFSegmentAccess segment_access =
@@ -3546,6 +3619,13 @@ auto MasterService::BatchReplicaClear(
 bool MasterService::IsReplicaReadable(const Replica& replica) const {
     if (!replica.is_completed() || replica.has_invalid_mem_handle() ||
         replica.has_invalid_nof_handle()) {
+        return false;
+    }
+    // A LOCAL_DISK replica is readable only while the registration it was
+    // admitted under is current: from the moment its owner unmounts the disk
+    // or expires, even before cleanup reaches its metadata.
+    if (replica.is_local_disk_replica() &&
+        !IsLocalDiskRegistrationCurrent(replica)) {
         return false;
     }
     const auto descriptor = replica.get_descriptor();
@@ -4380,10 +4460,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         auto now = std::chrono::system_clock::now();
         std::optional<size_t> retry_shard_idx;
         {
-            std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-            auto alive_clients = ok_client_;
-            client_lock.unlock();
             const size_t lookup_shard_idx =
                 getMetadataShardIndex(object_id.tenant_id, object_id.user_key);
             MetadataShardAccessorRW shard(this, lookup_shard_idx);
@@ -4400,8 +4477,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
             auto it = tenant_state.metadata.find(key);
             if (it != tenant_state.metadata.end()) {
-                auto cleanup_plan =
-                    BuildStaleHandleCleanupPlan(it->second, alive_clients);
+                auto cleanup_plan = BuildStaleHandleCleanupPlan(it->second);
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
                         "PutStart(stale cleanup)", object_id.tenant_id, key,
@@ -4413,7 +4489,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     } else if (CleanupStaleHandles(tenant_state, it->second,
-                                                   alive_clients, &shard)) {
+                                                   &shard)) {
                         EraseMetadata(tenant_state, it, object_id.tenant_id,
                                       QuotaEraseMode::kFull, &shard);
                         it = tenant_state.metadata.end();
@@ -4685,8 +4761,15 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     // deregistration can race; with the subsystem off both the mount and
     // unmount RPCs refuse, so there is nothing to check against and no race
     // to close.
-    if (enable_offload_ && !HasMountedLocalDiskSegment(client_id)) {
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    if (enable_offload_) {
+        // Bound to the registration current now; a caller that already
+        // bound one (NotifyOffloadSuccess) must still hold it.
+        const auto generation = local_ssd_manager_.Generation(client_id);
+        const auto bound = replica.get_local_disk_generation().value_or(0);
+        if (!generation || (bound != 0 && bound != *generation)) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        replica.set_local_disk_generation(*generation);
     }
     const ObjectIdentity object_id{std::move(normalized_tenant), key};
     MetadataAccessorRW accessor(this, object_id);
@@ -4703,6 +4786,12 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // A LOCAL_DISK replica of an ended registration is garbage awaiting
+    // cleanup; it must not stand in for this live one.
+    if (!(enable_ha_ && enable_oplog_)) {
+        CleanupStaleHandles(accessor.GetTenantState(), metadata,
+                            &accessor.GetShard());
+    }
     const bool replacing_existing =
         metadata.HasReplica(&Replica::fn_is_local_disk_replica);
 
@@ -5044,10 +5133,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             case_a_committed_soft_pin_timeout;
         {
             // --- Lock acquisition ---
-            std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-            auto alive_clients = ok_client_;
-            client_lock.unlock();
             // Use getMetadataShardIndex to find the object at its current shard
             // (handles both grouped and ungrouped routing).
             const size_t lookup_shard_idx =
@@ -5068,8 +5154,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
             // --- Step 0: stale handle cleanup ---
             if (it != tenant_state.metadata.end()) {
-                auto cleanup_plan =
-                    BuildStaleHandleCleanupPlan(it->second, alive_clients);
+                auto cleanup_plan = BuildStaleHandleCleanupPlan(it->second);
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
                         "UpsertStart(stale cleanup)", object_id.tenant_id, key,
@@ -5081,7 +5166,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     } else if (CleanupStaleHandles(tenant_state, it->second,
-                                                   alive_clients, &shard)) {
+                                                   &shard)) {
                         // EraseMetadata handles processing_keys,
                         // replication_tasks, offloading_tasks (with
                         // dec_refcnt), and promotion task cleanup.
@@ -6782,10 +6867,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
         keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
     }
 
-    std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-    auto alive_clients = ok_client_;
-    client_lock.unlock();
 
     // Process each shard once, acquiring lock per shard
     for (auto& [shard_idx, key_group] : keys_by_shard) {
@@ -6812,8 +6894,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Clean up stale replica handles (consistent with single Remove).
-            auto cleanup_plan =
-                BuildStaleHandleCleanupPlan(it->second, alive_clients);
+            auto cleanup_plan = BuildStaleHandleCleanupPlan(it->second);
             if (!cleanup_plan.removed_ids.empty()) {
                 auto persist_result = PersistStaleHandleCleanupForHA(
                     "BatchRemove(stale cleanup)", normalized_tenant, key,
@@ -6830,7 +6911,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                             : ErrorCode::OBJECT_ALREADY_EXISTS);
                     continue;
                 } else if (CleanupStaleHandles(tenant_state, it->second,
-                                               alive_clients, &shard)) {
+                                               &shard)) {
                     EraseMetadata(tenant_state, it, normalized_tenant,
                                   QuotaEraseMode::kFull, &shard);
                     if (tenant_state.Empty()) {
@@ -6945,22 +7026,15 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
                                        metadata.user_key);
 }
 
-bool MasterService::CleanupStaleHandles(
-    TenantState& tenant_state, ObjectMetadata& metadata,
-    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
-    MetadataShardAccessorRW* shard) {
-    // Removes replicas with invalid allocators (memory replicas on unmounted
-    // segments) and local_disk replicas whose owner client is no longer alive.
-    // Kept as a thin wrapper over the predicate form so the owner-targeted
-    // LOCAL_DISK sweep (ClearLocalDiskHandlesOwnedBy) shares this accounting
-    // rather than duplicating it.
+bool MasterService::CleanupStaleHandles(TenantState& tenant_state,
+                                        ObjectMetadata& metadata,
+                                        MetadataShardAccessorRW* shard) {
+    // Removes the object's reclaimable replicas: memory or NoF replicas on
+    // unmounted segments, and LOCAL_DISK replicas whose registration ended.
     return CleanupStaleHandles(
         tenant_state, metadata,
-        [&alive_clients](const Replica& replica) {
-            return (replica.has_invalid_mem_handle() ||
-                    replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(alive_clients)) &&
-                   replica.is_completed();
+        [this](const Replica& replica) {
+            return IsReplicaReclaimable(replica);
         },
         shard);
 }
@@ -7159,24 +7233,26 @@ size_t MasterService::GetKeyCount() const {
 
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
-    ClientStatus client_status;
-    {
-        std::shared_lock<std::shared_mutex> lock(client_mutex_);
-        auto it = ok_client_.find(client_id);
-        if (it != ok_client_.end()) {
-            client_status = ClientStatus::OK;
-        } else {
-            client_status = ClientStatus::NEED_REMOUNT;
-        }
-    }
-    PodUUID pod_client_id = {client_id.first, client_id.second};
-    if (!client_ping_queue_.push(pod_client_id)) {
-        // Queue is full
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=client_ping_queue_full";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
+    // Only liveness_mutex_, a leaf: a Ping is recorded and answered whatever
+    // else the master is doing.
+    const ClientStatus client_status = ObserveClient(client_id)
+                                           ? ClientStatus::OK
+                                           : ClientStatus::NEED_REMOUNT;
     return PingResponse(view_version_, client_status);
+}
+
+bool MasterService::ObserveClient(const UUID& client_id) {
+    std::lock_guard<std::mutex> lock(liveness_mutex_);
+    auto& liveness = client_liveness_[client_id];
+    liveness.last_seen = std::chrono::steady_clock::now();
+    return liveness.ok;
+}
+
+void MasterService::SetClientLivenessOk(const UUID& client_id, bool ok) {
+    std::lock_guard<std::mutex> lock(liveness_mutex_);
+    auto& liveness = client_liveness_[client_id];
+    liveness.last_seen = std::chrono::steady_clock::now();
+    liveness.ok = ok;
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
@@ -7222,14 +7298,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
     // Without this, a client that only registers LocalSSD (and
     // doesn't ping) would be considered expired by ClientMonitorFunc, which
     // would then clear all its LOCAL_DISK replicas.
-    PodUUID pod_client_id;
-    pod_client_id.first = client_id.first;
-    pod_client_id.second = client_id.second;
-    if (!client_ping_queue_.push(pod_client_id)) {
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=client_ping_queue_full";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
+    ObserveClient(client_id);
 
     return {};
 }
@@ -7241,25 +7310,22 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
 
-    // Drop the client's LOCAL_DISK registration first: from here on
-    // OffloadObjectHeartbeat answers SEGMENT_NOT_FOUND, so the master hands
-    // this client no further offload work. Then sweep the replicas it still
-    // owns, so no reader can be given a replica whose owner is about to stop
-    // serving. The sweep walks every metadata shard, so it must run without
-    // the registry lock held -- the same order and the same reason as the
-    // expiry branch of ClientMonitorFunc.
+    // Retire the client's LOCAL_DISK registration: from here on its replicas
+    // are unservable (IsLocalDiskRegistrationCurrent: their generation is no
+    // longer current), OffloadObjectHeartbeat answers SEGMENT_NOT_FOUND, and
+    // no new replica is admitted for it. Their metadata is garbage, reclaimed
+    // by the cleanup worker in bounded batches: this RPC no longer walks the
+    // index (on eu-west1, at 13.8M keys, that walk held an RPC thread for
+    // 58 s and starved the Pings sharing it).
     //
-    // The deregistration takes snapshot_mutex_ exclusively.
-    // NotifyOffloadSuccess admits a disk-replica registration by checking
-    // this client's registration inside one shared-lock section together with
+    // Exclusive, as before: NotifyOffloadSuccess admits a disk replica by
+    // checking the registration inside one shared-lock section together with
     // the metadata write, so that section lands entirely before this
-    // deregistration (the sweep below erases the replica) or entirely after
-    // (the check refuses it). Without the exclusive lock a registration
-    // admitted against the old one could land in a shard the sweep had
-    // already passed and survive as a stale owner.
+    // retirement (the replica is then bound to the retired generation, and
+    // garbage) or entirely after (the check refuses it).
     std::optional<int64_t> reported_capacity;
     {
-        std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        auto snapshot_lock = LockSnapshotExclusive();
         reported_capacity = local_ssd_manager_.UnregisterClient(client_id);
     }
     if (!reported_capacity) {
@@ -7271,16 +7337,7 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
         MasterMetricManager::instance().dec_total_file_capacity(
             *reported_capacity);
     }
-
-    // Sweep exactly this owner's replicas. Deliberately not a
-    // liveness-complement sweep (ClearInvalidHandles with a staying set):
-    // that classifies by absence from a point-in-time snapshot, so an owner
-    // that mounts and registers after the snapshot but before the sweep
-    // reaches its shard would have its replicas classified stale and
-    // erased -- and when that disk replica was the key's only one, the key
-    // itself. An owner-id predicate cannot misclassify a concurrent mount,
-    // whatever the interleaving.
-    ClearLocalDiskHandlesOwnedBy(client_id);
+    RequestStaleHandleCleanup();
 
     LOG(INFO) << "client_id=" << client_id
               << ", action=unmount_local_disk_segment_by_request";
@@ -7409,6 +7466,7 @@ auto MasterService::NotifyOffloadSuccess(
 
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+        uint64_t admitted_generation = 0;
         bool handled_existing_object = false;
         bool added_new_local_disk_replica = false;
         {
@@ -7428,8 +7486,14 @@ auto MasterService::NotifyOffloadSuccess(
             // deregistration can race; with the subsystem off both the mount
             // and unmount RPCs refuse, so there is nothing to check against
             // and no race to close.
-            const bool segment_mounted =
-                !enable_offload_ || HasMountedLocalDiskSegment(client_id);
+            const auto generation =
+                enable_offload_ ? local_ssd_manager_.Generation(client_id)
+                                : std::optional<uint64_t>(0);
+            const bool segment_mounted = generation.has_value();
+            if (generation) {
+                admitted_generation = *generation;
+                replica.set_local_disk_generation(*generation);
+            }
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
@@ -7454,6 +7518,13 @@ auto MasterService::NotifyOffloadSuccess(
                     }
                     tenant_state.offloading_tasks.erase(task_it);
 
+                    if (segment_mounted && !(enable_ha_ && enable_oplog_)) {
+                        // A LOCAL_DISK replica of an ended registration is
+                        // garbage awaiting cleanup; it must not stand in for
+                        // this live one.
+                        CleanupStaleHandles(tenant_state, obj_metadata,
+                                            &accessor.GetShard());
+                    }
                     if (!segment_mounted) {
                         // The offload bookkeeping above still ran; only the
                         // registration is refused.
@@ -7524,10 +7595,15 @@ auto MasterService::NotifyOffloadSuccess(
                            << ", key=" << object_id.user_key;
                 return tl::make_unexpected(res.error());
             }
+            // AddReplica refused it unless admitted_generation, bound above,
+            // was still current.
             added_new_local_disk_replica = res.value();
         }
         if (metadata.data_size > 0 && added_new_local_disk_replica) {
-            local_ssd_manager_.AdjustUsedBytes(client_id, metadata.data_size);
+            // Credited to the registration the replica is bound to; if that
+            // one ended meanwhile, its bytes went with it.
+            local_ssd_manager_.AdjustUsedBytes(client_id, metadata.data_size,
+                                               admitted_generation);
         }
     }
 
@@ -9573,8 +9649,9 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
         ok_client_.clear();
     }
-    PodUUID pod_uuid;
-    while (client_ping_queue_.pop(pod_uuid)) {
+    {
+        std::lock_guard<std::mutex> lock(liveness_mutex_);
+        client_liveness_.clear();
     }
 
     MasterMetricManager::instance().reset_allocated_mem_size();
@@ -11017,126 +11094,141 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 }
 
 void MasterService::ClientMonitorFunc() {
-    std::unordered_map<UUID, std::chrono::steady_clock::time_point,
-                       boost::hash<UUID>>
-        client_ttl;
     while (client_monitor_running_) {
-        auto now = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const auto ttl = std::chrono::seconds(client_live_ttl_sec_);
 
-        // Update the client ttl
-        PodUUID pod_client_id;
-        while (client_ping_queue_.pop(pod_client_id)) {
-            UUID client_id = {pod_client_id.first, pod_client_id.second};
-            client_ttl[client_id] =
-                now + std::chrono::seconds(client_live_ttl_sec_);
-        }
-
-        // Find out expired clients
-        std::vector<UUID> expired_clients;
-        for (auto it = client_ttl.begin(); it != client_ttl.end();) {
-            if (it->second < now) {
-                LOG(INFO) << "client_id=" << it->first
-                          << ", action=client_expired";
-                expired_clients.push_back(it->first);
-                it = client_ttl.erase(it);
-            } else {
-                ++it;
+        // Only the leaf lock, briefly: Pings keep landing while expired
+        // clients are handled below.
+        std::vector<UUID> candidates;
+        {
+            std::lock_guard<std::mutex> lock(liveness_mutex_);
+            for (const auto& [client_id, liveness] : client_liveness_) {
+                if (liveness.last_seen + ttl <= now) {
+                    candidates.push_back(client_id);
+                }
             }
         }
-
-        // Update the client status to NEED_REMOUNT
-        if (!expired_clients.empty()) {
-            // Notify graceful unmount scheduler to drop pending records
-            // for expired clients. The actual unmount is handled below.
-            for (auto& cid : expired_clients) {
-                graceful_unmount_scheduler_.RemoveIf(
-                    [&cid](const GracefulUnmountDeadlineRecord& record) {
-                        return record.client_id == cid;
-                    });
-            }
-
-            // Record which segments are unmounted, will be used in the commit
-            // phase.
-            std::vector<UUID> unmount_segments;
-            std::vector<size_t> dec_capacities;
-            std::vector<UUID> client_ids;
-            std::vector<std::string> segment_names;
-            std::unordered_set<UUID, boost::hash<UUID>> alive_clients;
-            std::shared_lock<std::shared_mutex> snapshot_lock;
-            {
-                std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
-                snapshot_lock =
-                    std::shared_lock<std::shared_mutex>(snapshot_mutex_);
-                for (auto& client_id : expired_clients) {
-                    auto it = ok_client_.find(client_id);
-                    if (it != ok_client_.end()) {
-                        ok_client_.erase(it);
-                        MasterMetricManager::instance().dec_active_clients();
-                    }
-                    client_host_id_.erase(client_id);
-                }
-                alive_clients = ok_client_;
-
-                ScopedSegmentAccess segment_access =
-                    segment_manager_.getSegmentAccess();
-                for (auto& client_id : expired_clients) {
-                    // mounted mem segemtns of this expired client
-                    std::vector<Segment> segments;
-                    segment_access.GetClientSegments(client_id, segments);
-                    for (auto& seg : segments) {
-                        size_t metrics_dec_capacity = 0;
-                        if (segment_access.PrepareUnmountSegment(
-                                seg.id, metrics_dec_capacity) ==
-                            ErrorCode::OK) {
-                            unmount_segments.push_back(seg.id);
-                            dec_capacities.push_back(metrics_dec_capacity);
-                            client_ids.push_back(client_id);
-                            segment_names.push_back(seg.name);
-                        } else {
-                            LOG(ERROR) << "client_id=" << client_id
-                                       << ", segment_name=" << seg.name
-                                       << ", "
-                                          "error=prepare_unmount_expired_"
-                                          "mem_segment_failed";
-                        }
-                    }
-                }
-            }  // Release the mutex before long-running ClearInvalidHandles and
-               // avoid deadlocks
-
-            // Always clean up invalid handles when there are expired clients,
-            // even if no memory segments were unmounted. This is necessary
-            // to clean up local_disk replicas whose owner client has expired.
-            ClearInvalidHandles(alive_clients);
-
-            // Commit unmount of memory segments and clean up local_disk
-            // segments for expired clients. Both require the exclusive
-            // segment lock.
-            {
-                ScopedSegmentAccess segment_access =
-                    segment_manager_.getSegmentAccess();
-                for (size_t i = 0; i < unmount_segments.size(); i++) {
-                    segment_access.CommitUnmountSegment(
-                        unmount_segments[i], client_ids[i], dec_capacities[i]);
-                    LOG(INFO) << "client_id=" << client_ids[i]
-                              << ", segment_name=" << segment_names[i]
-                              << ", action=unmount_expired_mem_segment";
-                    // Clean up HTTP metadata if enabled
-                    cleanupHttpMetadata(segment_names[i]);
-                }
-            }
-            for (const auto& client_id : expired_clients) {
-                auto capacity = local_ssd_manager_.UnregisterClient(client_id);
-                if (capacity && *capacity > 0) {
-                    MasterMetricManager::instance().dec_total_file_capacity(
-                        *capacity);
-                }
-            }
-            RecomputeTenantEffectiveQuotas();
+        if (!candidates.empty()) {
+            ExpireClients(candidates, now);
         }
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kClientMonitorSleepMs));
+    }
+}
+
+void MasterService::ExpireClients(const std::vector<UUID>& candidates,
+                                  std::chrono::steady_clock::time_point now) {
+    const auto ttl = std::chrono::seconds(client_live_ttl_sec_);
+    // Graceful unmounts pending for these clients are superseded by the
+    // expiry below; a client that pings again keeps its record anyway.
+    for (const auto& cid : candidates) {
+        graceful_unmount_scheduler_.RemoveIf(
+            [&cid](const GracefulUnmountDeadlineRecord& record) {
+                return record.client_id == cid;
+            });
+    }
+
+    std::vector<UUID> expired_clients;
+    std::vector<UUID> unmount_segments;
+    std::vector<size_t> dec_capacities;
+    std::vector<UUID> client_ids;
+    std::vector<std::string> segment_names;
+    bool retired_disk = false;
+    {
+        // snapshot_mutex_ before client_mutex_ (the global lock order):
+        // nothing here holds client_mutex_ while it waits.
+        std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        {
+            std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+            {
+                // Revalidate: a client that pinged since it was selected
+                // stays.
+                std::lock_guard<std::mutex> lock(liveness_mutex_);
+                for (const auto& client_id : candidates) {
+                    auto it = client_liveness_.find(client_id);
+                    if (it != client_liveness_.end() &&
+                        it->second.last_seen + ttl <= now) {
+                        client_liveness_.erase(it);
+                        expired_clients.push_back(client_id);
+                    }
+                }
+            }
+            if (expired_clients.empty()) {
+                return;
+            }
+            for (const auto& client_id : expired_clients) {
+                LOG(INFO) << "client_id=" << client_id
+                          << ", action=client_expired";
+                if (ok_client_.erase(client_id) != 0) {
+                    MasterMetricManager::instance().dec_active_clients();
+                }
+                client_host_id_.erase(client_id);
+            }
+
+            // Prepare releases each segment's allocator: from here on no
+            // reader is given a replica on it (IsReplicaReadable).
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            for (const auto& client_id : expired_clients) {
+                std::vector<Segment> segments;
+                segment_access.GetClientSegments(client_id, segments);
+                for (const auto& seg : segments) {
+                    size_t metrics_dec_capacity = 0;
+                    if (segment_access.PrepareUnmountSegment(
+                            seg.id, metrics_dec_capacity) == ErrorCode::OK) {
+                        unmount_segments.push_back(seg.id);
+                        dec_capacities.push_back(metrics_dec_capacity);
+                        client_ids.push_back(client_id);
+                        segment_names.push_back(seg.name);
+                    } else {
+                        LOG(ERROR) << "client_id=" << client_id
+                                   << ", segment_name=" << seg.name
+                                   << ", error=prepare_unmount_expired_"
+                                      "mem_segment_failed";
+                    }
+                }
+            }
+        }
+
+        // Without background cleanup (HA, snapshot or CXL), sweep before the
+        // commit, as before. Otherwise the metadata still naming these
+        // segments and registrations is garbage, reclaimed by the cleanup
+        // worker: the same order UnmountSegment uses.
+        if (!enable_async_segment_cleanup_) {
+            ClearInvalidHandles(/*lock_snapshot_per_batch=*/false);
+        }
+
+        {
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            for (size_t i = 0; i < unmount_segments.size(); i++) {
+                segment_access.CommitUnmountSegment(
+                    unmount_segments[i], client_ids[i], dec_capacities[i]);
+                LOG(INFO) << "client_id=" << client_ids[i]
+                          << ", segment_name=" << segment_names[i]
+                          << ", action=unmount_expired_mem_segment";
+                cleanupHttpMetadata(segment_names[i]);
+            }
+        }
+        // Retiring a registration makes its LOCAL_DISK replicas unservable
+        // at once (IsLocalDiskRegistrationCurrent).
+        for (const auto& client_id : expired_clients) {
+            auto capacity = local_ssd_manager_.UnregisterClient(client_id);
+            if (capacity) {
+                retired_disk = true;
+                if (*capacity > 0) {
+                    MasterMetricManager::instance().dec_total_file_capacity(
+                        *capacity);
+                }
+            }
+        }
+    }
+    RecomputeTenantEffectiveQuotas();
+    if (enable_async_segment_cleanup_ &&
+        (!unmount_segments.empty() || retired_disk)) {
+        replica_cleanup_worker_.Schedule();
     }
 }
 
@@ -11170,10 +11262,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     const MountedNoFSegmentSnapshot& snapshot,
     const std::string& error_reason) {
     size_t metrics_dec_capacity = 0;
-    std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-    auto alive_clients = ok_client_;
-    client_lock.unlock();
     {
         auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
         ErrorCode err = nof_segment_access.PrepareUnmountSegment(
@@ -11197,7 +11286,11 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
         }
     }
 
-    ClearInvalidHandles(alive_clients);
+    if (enable_async_segment_cleanup_) {
+        replica_cleanup_worker_.Schedule();
+    } else {
+        ClearInvalidHandles(/*lock_snapshot_per_batch=*/false);
+    }
 
     {
         auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();

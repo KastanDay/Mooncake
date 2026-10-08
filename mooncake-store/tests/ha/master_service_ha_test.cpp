@@ -605,12 +605,6 @@ class MasterServiceHATest : public ::testing::Test {
         return service.ordered_oplog_writer_->Reserve();
     }
 
-    static void ClearInvalidHandlesForTesting(
-        MasterService& service,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
-        service.ClearInvalidHandles(alive_clients);
-    }
-
     static void ClearInvalidHandlesForTesting(MasterService& service) {
         service.ClearInvalidHandles();
     }

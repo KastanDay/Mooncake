@@ -71,7 +71,12 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
     if (alloc) {
         endpoint = alloc->getTransportEndpoint();
     } else {
-        LOG(ERROR) << "allocator=expired_or_null in get_descriptor";
+        // Expected for a replica whose segment was just unmounted, until
+        // cleanup reclaims it: rate-limited, since a sweep may meet millions
+        // (27,432 in one minute on eu-west1, each under a shard lock).
+        LOG_EVERY_N(ERROR, 10000)
+            << "allocator=expired_or_null in get_descriptor ("
+            << google::COUNTER << " so far)";
     }
 
     if (this->protocol == "cxl") {

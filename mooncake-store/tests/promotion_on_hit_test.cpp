@@ -2544,6 +2544,10 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
         EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
 
+    // The holder's disk goes away: its LOCAL_DISK replica is now garbage,
+    // whether the cleanup worker or BatchRemove's stale-handle path reaches
+    // it first.
+    ASSERT_TRUE(service->UnmountLocalDiskSegment(holder.client_id).has_value());
     auto results =
         service->BatchRemove({"k_first"}, TenantId::Default(), /*force=*/true);
     ASSERT_EQ(results.size(), 1u);
