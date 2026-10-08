@@ -10184,9 +10184,9 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 const size_t buckets = metadata_map.bucket_count();
                 const size_t first = buckets ? randomIndex(buckets) : 0;
                 std::vector<std::string> keys;
-                for (size_t b = 0; b < buckets &&
-                                   total.freed_bytes < target_bytes &&
-                                   !total.budget_exhausted;
+                for (size_t b = 0;
+                     b < buckets && total.freed_bytes < target_bytes &&
+                     !total.budget_exhausted;
                      ++b) {
                     const size_t bucket = (first + b) % buckets;
                     keys.clear();
