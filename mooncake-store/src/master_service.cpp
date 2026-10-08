@@ -1557,14 +1557,19 @@ void MasterService::TrimTenantsOverQuota() {
             const auto result =
                 EvictTenantMemoryForQuota(tenant.tenant_id, over);
             freed_any = freed_any || result.freed_bytes > 0;
-            LOG(INFO) << "action=trim_tenant_quota, tenant=" << tenant.tenant_id
-                      << ", over_bytes=" << over
-                      << ", freed_bytes=" << result.freed_bytes
-                      << ", evicted_objects=" << result.evicted_objects
-                      << ", elapsed_ms="
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - started)
-                             .count();
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started)
+                    .count();
+            // A routine trim (a refused write's few objects) is not news.
+            const bool notable =
+                elapsed_ms >= 100 || result.evicted_objects >= 1000;
+            LOG_IF(INFO, notable || VLOG_IS_ON(1))
+                << "action=trim_tenant_quota, tenant=" << tenant.tenant_id
+                << ", over_bytes=" << over
+                << ", freed_bytes=" << result.freed_bytes
+                << ", evicted_objects=" << result.evicted_objects
+                << ", elapsed_ms=" << elapsed_ms;
         }
         if (!freed_any) {
             return;
@@ -10169,32 +10174,54 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     continue;
                 }
                 auto& tenant_state = tenant_it->second;
-                for (auto it = tenant_state.metadata.begin();
-                     it != tenant_state.metadata.end() &&
-                     total.freed_bytes < target_bytes;) {
-                    if (++keys_examined > max_keys_examined) {
-                        total.budget_exhausted = true;
-                        break;
+                auto& metadata_map = tenant_state.metadata;
+                // From a random bucket, a bucket at a time: an evicted key
+                // that keeps a disk replica stays where it was, so a walk
+                // from begin() would re-examine a growing run of keys that
+                // free nothing on every call. Keys are copied per bucket and
+                // looked up again (an eviction may erase group members; the
+                // map is never rehashed under the shard lock).
+                const size_t buckets = metadata_map.bucket_count();
+                const size_t first = buckets ? randomIndex(buckets) : 0;
+                std::vector<std::string> keys;
+                for (size_t b = 0; b < buckets &&
+                                   total.freed_bytes < target_bytes &&
+                                   !total.budget_exhausted;
+                     ++b) {
+                    const size_t bucket = (first + b) % buckets;
+                    keys.clear();
+                    for (auto lit = metadata_map.cbegin(bucket);
+                         lit != metadata_map.cend(bucket); ++lit) {
+                        keys.push_back(lit->first);
                     }
-                    auto& metadata = it->second;
-                    if (metadata.IsHardPinned() ||
-                        !metadata.IsLeaseExpired(now) ||
-                        (!allow_soft_pinned &&
-                         IsSoftPinActive(metadata, now)) ||
-                        !can_evict_replicas(metadata)) {
-                        ++it;
-                        continue;
-                    }
-
-                    auto evict_result = try_evict_group_or_object(
-                        it->first, metadata, tenant_state, deferred_replicas,
-                        allow_soft_pinned);
-                    total.freed_bytes += evict_result.freed_bytes;
-                    total.evicted_objects += evict_result.evicted_objects;
-                    if (!metadata.IsValid()) {
-                        it = EraseMetadata(tenant_state, it, normalized_tenant);
-                    } else {
-                        ++it;
+                    for (const auto& key : keys) {
+                        if (total.freed_bytes >= target_bytes) {
+                            break;
+                        }
+                        if (++keys_examined > max_keys_examined) {
+                            total.budget_exhausted = true;
+                            break;
+                        }
+                        auto it = metadata_map.find(key);
+                        if (it == metadata_map.end()) {
+                            continue;
+                        }
+                        auto& metadata = it->second;
+                        if (metadata.IsHardPinned() ||
+                            !metadata.IsLeaseExpired(now) ||
+                            (!allow_soft_pinned &&
+                             IsSoftPinActive(metadata, now)) ||
+                            !can_evict_replicas(metadata)) {
+                            continue;
+                        }
+                        auto evict_result = try_evict_group_or_object(
+                            it->first, metadata, tenant_state,
+                            deferred_replicas, allow_soft_pinned);
+                        total.freed_bytes += evict_result.freed_bytes;
+                        total.evicted_objects += evict_result.evicted_objects;
+                        if (!metadata.IsValid()) {
+                            EraseMetadata(tenant_state, it, normalized_tenant);
+                        }
                     }
                 }
                 if (tenant_state.Empty()) {
