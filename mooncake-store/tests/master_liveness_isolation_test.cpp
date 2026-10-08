@@ -180,6 +180,15 @@ class MasterLivenessIsolationTest : public ::testing::Test {
     static std::shared_mutex& ClientMutex(MasterService& service) {
         return service.client_mutex_;
     }
+    static uint64_t Generation(MasterService& service, const UUID& id) {
+        return service.local_ssd_manager_.Generation(id).value_or(0);
+    }
+    static ErrorCode EnqueuePromotion(MasterService& service, const UUID& id,
+                                      PromotionTaskItem task,
+                                      uint64_t generation) {
+        return service.local_ssd_manager_.EnqueuePromotion(id, std::move(task),
+                                                           generation);
+    }
     static bool BackgroundCleanup(MasterService& service) {
         return service.enable_async_segment_cleanup_;
     }
@@ -296,8 +305,12 @@ TEST_F(MasterLivenessIsolationTest, PingIsAnsweredWhileARemountWaitsOnAPass) {
         service->ReMountSegment({b.segment}, b.id);
         remount_done = true;
     });
-    ASSERT_TRUE(WaitFor([&] { return SnapshotWritersWaiting(*service) > 0; },
-                        milliseconds(5000)))
+    // No fatal assertion while the threads run: a failure must still release
+    // the pass and join them.
+    const bool remount_waiting =
+        WaitFor([&] { return SnapshotWritersWaiting(*service) > 0; },
+                milliseconds(5000));
+    EXPECT_TRUE(remount_waiting)
         << "the remount never waited for the held pass";
     EXPECT_FALSE(remount_done);
 
@@ -466,33 +479,58 @@ TEST_F(MasterLivenessIsolationTest, ReclaimPassYieldsToExclusiveWriters) {
     auto service = MakeService();
     auto a = MountClient(*service, "yield_a", 0x100000000);
     auto b = MountClient(*service, "yield_b", 0x200000000);
-    OffloadDiskOnlyKeys(*service, a, "yield_key_", 300000);
+    // Enough keys for a pass of about a second, far longer than a remount.
+    OffloadDiskOnlyKeys(*service, a, "yield_key_", 1000000);
     RetireDiskWithoutCleanup(*service, a.id);
 
+    std::atomic<bool> pass_started{false};
     std::atomic<bool> pass_done{false};
-    std::thread pass([&] {
+    auto pass = std::async(std::launch::async, [&] {
+        pass_started = true;
         ReclaimNow(*service);
         pass_done = true;
     });
-    std::this_thread::sleep_for(milliseconds(2));
-    const bool pass_running = !pass_done;
-    std::atomic<bool> remount_done{false};
-    std::thread remount([&] {
-        service->ReMountSegment({b.segment}, b.id);
-        remount_done = true;
-    });
-    // The remount must finish while the pass is still going, not after it.
-    while (!remount_done && !pass_done) {
-        std::this_thread::sleep_for(milliseconds(1));
+    while (!pass_started) {
+        std::this_thread::yield();
     }
-    const bool remount_first = remount_done && !pass_done;
-    remount.join();
-    pass.join();
-    if (!pass_running) {
+    std::this_thread::sleep_for(milliseconds(20));  // Into its batches.
+    const bool started_mid_pass = !pass_done;
+    // The remount thread itself records whether the pass was still running
+    // when it finished: the order, not a later observation.
+    auto finished_mid_pass = std::async(std::launch::async, [&] {
+        service->ReMountSegment({b.segment}, b.id);
+        return !pass_done.load();
+    });
+    ASSERT_EQ(finished_mid_pass.wait_for(std::chrono::seconds(60)),
+              std::future_status::ready);
+    const bool remount_first = finished_mid_pass.get();
+    ASSERT_EQ(pass.wait_for(std::chrono::seconds(120)),
+              std::future_status::ready);
+    if (!started_mid_pass) {
         GTEST_SKIP() << "the pass finished before the remount started";
     }
     EXPECT_TRUE(remount_first) << "the remount waited for the whole pass";
     EXPECT_EQ(DiskReplicasOwnedBy(*service, a.id), 0u);
+}
+
+// A promotion task for a replica of an ended registration never reaches the
+// mailbox of a later registration under the same id.
+TEST_F(MasterLivenessIsolationTest, PromotionEnqueueIsBoundToRegistration) {
+    auto service = MakeService();
+    auto a = MountClient(*service, "promo_a", 0x100000000);
+    const uint64_t old_generation = Generation(*service, a.id);
+    RetireDiskWithoutCleanup(*service, a.id);
+    ASSERT_TRUE(service->MountLocalDiskSegment(a.id, true).has_value());
+    const uint64_t new_generation = Generation(*service, a.id);
+    ASSERT_NE(old_generation, new_generation);
+
+    PromotionTaskItem task{.tenant_id = TenantId::Default().value(),
+                           .key = "promo_key",
+                           .size = 64};
+    EXPECT_EQ(EnqueuePromotion(*service, a.id, task, old_generation),
+              ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_EQ(EnqueuePromotion(*service, a.id, task, new_generation),
+              ErrorCode::OK);
 }
 
 // End to end through the monitor thread: one client stops pinging; it alone

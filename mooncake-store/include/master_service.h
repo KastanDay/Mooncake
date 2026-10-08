@@ -1014,8 +1014,9 @@ class MasterService {
         bool lock_snapshot_per_batch = true,
         const std::unordered_set<UUID, boost::hash<UUID>>& retired_owners = {});
     // Shard walk behind it; removes completed replicas matching is_stale,
-    // erasing a key when no valid replica remains. Visits at most
-    // kStaleHandleBatchKeys keys per shard-lock hold.
+    // erasing a key when no valid replica remains. Visits about
+    // kStaleHandleBatchKeys keys (whole buckets, at most
+    // kStaleHandleBatchBuckets of them) per shard-lock hold.
     void ClearStaleHandles(const std::function<bool(const Replica&)>& is_stale,
                            bool lock_snapshot_per_batch);
     static constexpr size_t kStaleHandleBatchKeys = 256;

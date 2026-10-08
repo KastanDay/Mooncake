@@ -308,9 +308,11 @@ bool LocalSsdManager::CancelOffloadsIfAllPending(
 }
 
 ErrorCode LocalSsdManager::EnqueuePromotion(const UUID& client_id,
-                                            PromotionTaskItem task) {
+                                            PromotionTaskItem task,
+                                            uint64_t generation) {
     auto client = FindClient(client_id);
-    if (!client) {
+    if (!client ||
+        (generation != 0 && client->record->generation != generation)) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     return client->record->mailbox.EnqueuePromotion(std::move(task));

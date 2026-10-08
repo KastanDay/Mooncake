@@ -2655,8 +2655,8 @@ void MasterService::ClearStaleHandles(
                 size_t buckets = 0;
                 std::vector<std::string> stale_keys;
                 // Bounded in keys and in buckets (a sparse map after shrinking
-                // has many empty ones). One bucket is never split, so a
-                // pathological collision chain is the only overrun.
+                // has many empty ones). A soft bound: a bucket is never split,
+                // so a batch can end a bucket's length past the key budget.
                 while (bucket < bucket_count &&
                        visited < kStaleHandleBatchKeys &&
                        buckets < kStaleHandleBatchBuckets) {
@@ -7755,13 +7755,17 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
     if (!holder_id.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // Into the mailbox of the registration the source is bound to, checked
+    // on the record that owns the mailbox.
     auto err = local_ssd_manager_.EnqueuePromotion(
-        *holder_id, PromotionTaskItem{.tenant_id = object_id.tenant_id.value(),
-                                      .key = object_id.user_key,
-                                      .size = static_cast<int64_t>(
-                                          source_replica.get_descriptor()
-                                              .get_local_disk_descriptor()
-                                              .object_size)});
+        *holder_id,
+        PromotionTaskItem{
+            .tenant_id = object_id.tenant_id.value(),
+            .key = object_id.user_key,
+            .size = static_cast<int64_t>(source_replica.get_descriptor()
+                                             .get_local_disk_descriptor()
+                                             .object_size)},
+        source_replica.get_local_disk_generation().value_or(0));
     if (err == ErrorCode::SEGMENT_NOT_FOUND) {
         // Holder client expired or never registered LocalSSD;
         // the LOCAL_DISK replica will be cleaned up by ClientMonitorFunc on
@@ -9011,6 +9015,10 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     if (task_it->second.holder_id != client_id) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // A completion is accepted even if the source's disk registration ended
+    // after PromotionAllocStart: the holder itself copied the bytes from its
+    // own file into the staged replica, which is a valid copy in its own
+    // right. Only reads from the disk replica depend on that registration.
 
     bool committed = false;
     Replica* staged = metadata.GetReplicaByID(task_it->second.alloc_id);
@@ -11297,14 +11305,17 @@ void MasterService::ExpireClients(const std::vector<UUID>& candidates,
                 cleanupHttpMetadata(segment_names[i]);
             }
         }
-    }
-    // Graceful unmounts pending for the expired clients are superseded by
-    // the expiry (a client that pinged again was not expired, and keeps its).
-    for (const auto& cid : expired_clients) {
-        graceful_unmount_scheduler_.RemoveIf(
-            [&cid](const GracefulUnmountDeadlineRecord& record) {
-                return record.client_id == cid;
-            });
+        // Graceful unmounts pending for the expired clients are superseded
+        // by the expiry (a client that pinged again was not expired, and
+        // keeps its). Still under snapshot_mutex_: a remount and a new
+        // graceful unmount both need it exclusively, so no deadline set
+        // after this expiry can be removed here.
+        for (const auto& cid : expired_clients) {
+            graceful_unmount_scheduler_.RemoveIf(
+                [&cid](const GracefulUnmountDeadlineRecord& record) {
+                    return record.client_id == cid;
+                });
+        }
     }
     RecomputeTenantEffectiveQuotas();
     if (enable_async_segment_cleanup_ &&

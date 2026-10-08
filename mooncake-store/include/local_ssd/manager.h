@@ -104,7 +104,11 @@ class LocalSsdManager {
                                     const TenantId& tenant_id,
                                     std::string_view key);
 
-    ErrorCode EnqueuePromotion(const UUID& client_id, PromotionTaskItem task);
+    // A nonzero `generation` must be the client's current registration: a
+    // task for a replica of an ended registration never reaches the mailbox
+    // of a later one under the same id.
+    ErrorCode EnqueuePromotion(const UUID& client_id, PromotionTaskItem task,
+                               uint64_t generation = 0);
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode> TakePromotions(
         const UUID& client_id, size_t max_items);
     bool RemovePromotion(const UUID& client_id, const TenantId& tenant_id,
