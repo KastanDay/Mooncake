@@ -184,6 +184,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
               }
           }),
       replica_cleanup_worker_([this] { ClearInvalidHandles(); }),
+      quota_trim_worker_([this] { TrimTenantsOverQuota(); }),
       enable_async_segment_cleanup_(
           !config.enable_ha && !config.enable_snapshot && !config.enable_cxl),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
@@ -498,6 +499,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     VLOG(1) << "action=start_task_cleanup_thread";
 
     replica_cleanup_worker_.Start();
+    quota_trim_worker_.Start();
 
     // NOTE: The async HTTP metadata cleanup worker is started lazily in
     // setHttpMetadataRemoteUrl() once http_metadata_remote_ is initialized,
@@ -651,6 +653,7 @@ MasterService::~MasterService() {
     http_metadata_cleanup_running_ = false;
     graceful_unmount_scheduler_.Stop();
     replica_cleanup_worker_.Stop();
+    quota_trim_worker_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -1415,6 +1418,7 @@ void MasterService::ApplyTenantQuotaPolicies(
         throw std::invalid_argument(
             "tenant quota policy exceeds atomic accounting range");
     }
+    ScheduleQuotaTrimIfOver();  // A lowered quota, like a capacity drop.
 }
 
 void MasterService::LoadTenantQuotaPoliciesFromStoreOrThrow() {
@@ -1480,6 +1484,92 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
     std::lock_guard<std::mutex> recompute_lock(tenant_quota_recompute_mutex_);
     const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
     tenant_quota_table_.RecomputeEffectiveQuotas(capacity);
+    // Capacity fell (a Store left or shrank): trim at once, rather than when
+    // the next write finds its tenant over quota.
+    ScheduleQuotaTrimIfOver();
+}
+
+void MasterService::ScheduleQuotaTrimIfOver() {
+    for (const auto& tenant : tenant_quota_table_.ListTenantSnapshots()) {
+        if (tenant.has_explicit_policy &&
+            tenant.charged_bytes > tenant.effective_quota_bytes) {
+            quota_trim_worker_.Schedule();
+            return;
+        }
+    }
+}
+
+bool MasterService::MakeRoomForWrite(const TenantId& tenant_id,
+                                     uint64_t deficit_bytes) {
+    const auto started = std::chrono::steady_clock::now();
+    const auto result = EvictTenantMemoryForQuota(tenant_id, deficit_bytes,
+                                                  kInlineEvictionKeyBudget);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count();
+    if (elapsed_ms >= 100) {
+        LOG(WARNING) << "action=inline_quota_eviction_slow, tenant="
+                     << tenant_id << ", deficit_bytes=" << deficit_bytes
+                     << ", freed_bytes=" << result.freed_bytes
+                     << ", evicted_objects=" << result.evicted_objects
+                     << ", elapsed_ms=" << elapsed_ms;
+    }
+    if (result.freed_bytes >= deficit_bytes || !result.budget_exhausted) {
+        return true;  // Room made, or nothing more is evictable: as before.
+    }
+    {
+        std::lock_guard<std::mutex> lock(quota_trim_demand_mutex_);
+        auto& demand = quota_trim_demand_[tenant_id];
+        demand = std::max(demand, deficit_bytes - result.freed_bytes);
+    }
+    quota_trim_worker_.Schedule();
+    return false;
+}
+
+void MasterService::TrimTenantsOverQuota() {
+    // Rounds until no tenant is over and no refused write is waiting, or a
+    // round frees nothing (what is left is pinned, leased or in flight; the
+    // next capacity change or refused write schedules another).
+    for (int round = 0; round < 16; ++round) {
+        std::unordered_map<TenantId, uint64_t, TenantIdHash> demand;
+        {
+            std::lock_guard<std::mutex> lock(quota_trim_demand_mutex_);
+            demand.swap(quota_trim_demand_);
+        }
+        bool freed_any = false;
+        for (const auto& tenant : tenant_quota_table_.ListTenantSnapshots()) {
+            // A tenant without a policy (orphan state: its metadata outlived
+            // its policy) is left for its owner to clean up, as before.
+            if (!tenant.has_explicit_policy) {
+                continue;
+            }
+            const auto asked = demand.find(tenant.tenant_id);
+            const uint64_t over =
+                (tenant.charged_bytes > tenant.effective_quota_bytes
+                     ? tenant.charged_bytes - tenant.effective_quota_bytes
+                     : 0) +
+                (asked == demand.end() ? 0 : asked->second);
+            if (over == 0) {
+                continue;
+            }
+            const auto started = std::chrono::steady_clock::now();
+            const auto result =
+                EvictTenantMemoryForQuota(tenant.tenant_id, over);
+            freed_any = freed_any || result.freed_bytes > 0;
+            LOG(INFO) << "action=trim_tenant_quota, tenant=" << tenant.tenant_id
+                      << ", over_bytes=" << over
+                      << ", freed_bytes=" << result.freed_bytes
+                      << ", evicted_objects=" << result.evicted_objects
+                      << ", elapsed_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+        }
+        if (!freed_any) {
+            return;
+        }
+    }
 }
 
 MasterService::TenantState& MasterService::GetOrCreateTenantState(
@@ -2545,6 +2635,14 @@ bool MasterService::IsReplicaReclaimable(const Replica& replica) const {
     return it == client_liveness_.end() || !it->second.ok;
 }
 
+std::shared_lock<std::shared_mutex> MasterService::LockSnapshotForSection()
+    const {
+    while (snapshot_writers_waiting_.load(std::memory_order_acquire) > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return std::shared_lock<std::shared_mutex>(snapshot_mutex_);
+}
+
 std::unique_lock<std::shared_mutex> MasterService::LockSnapshotExclusive()
     const {
     // Announced while waiting, so the cleanup pass, which re-takes the lock
@@ -2628,17 +2726,10 @@ void MasterService::ClearStaleHandles(
             size_t bucket_count = 0;
             bool done = false;
             while (!done) {
-                if (lock_snapshot_per_batch) {
-                    while (snapshot_writers_waiting_.load(
-                               std::memory_order_acquire) > 0) {
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(1));
-                    }
-                }
                 std::optional<std::shared_lock<std::shared_mutex>>
                     snapshot_lock;
                 if (lock_snapshot_per_batch) {
-                    snapshot_lock.emplace(snapshot_mutex_);
+                    snapshot_lock.emplace(LockSnapshotForSection());
                 }
                 MetadataShardAccessorRW shard(this, i);
                 auto tenant_it = shard->tenants.find(tenant_id);
@@ -2717,7 +2808,9 @@ void MasterService::TaskCleanupThreadFunc() {
             break;
         }
 
-        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        // Short (expired entries only), but it steps aside for a waiting
+        // writer like every other background hold of snapshot_mutex_.
+        auto shared_lock = LockSnapshotForSection();
         {
             auto write_access = task_manager_.get_write_access();
             write_access.prune_expired_tasks();
@@ -4613,7 +4706,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 object_id.tenant_id.value(), "quota_exceeded");
             return result;
         }
-        EvictTenantMemoryForQuota(object_id.tenant_id, quota_deficit_bytes);
+        if (!MakeRoomForWrite(object_id.tenant_id, quota_deficit_bytes)) {
+            MasterMetricManager::instance().inc_tenant_quota_reject(
+                object_id.tenant_id.value(), "quota_trimming");
+            return result;
+        }
     }
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
@@ -5538,7 +5635,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 object_id.tenant_id.value(), "quota_exceeded");
             return result;
         }
-        EvictTenantMemoryForQuota(object_id.tenant_id, quota_deficit_bytes);
+        if (!MakeRoomForWrite(object_id.tenant_id, quota_deficit_bytes)) {
+            MasterMetricManager::instance().inc_tenant_quota_reject(
+                object_id.tenant_id.value(), "quota_trimming");
+            return result;
+        }
     }
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
@@ -9219,13 +9320,13 @@ void MasterService::EvictionThreadFunc() {
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
             // Try discarding expired processing keys and ongoing replication
             // tasks if we have not done this for a long time.
+            for (size_t i = 0; i < kNumShards; i++) {
+                auto snapshot = LockSnapshotForSection();
+                MetadataShardAccessorRW shard(this, i);
+                DiscardExpiredProcessingReplicas(shard, now);
+            }
             {
-                std::shared_lock<std::shared_mutex> shared_lock(
-                    snapshot_mutex_);
-                for (size_t i = 0; i < kNumShards; i++) {
-                    MetadataShardAccessorRW shard(this, i);
-                    DiscardExpiredProcessingReplicas(shard, now);
-                }
+                auto snapshot = LockSnapshotForSection();
                 ReleaseExpiredDiscardedReplicas(now);
             }
             last_discard_time = now;
@@ -9877,7 +9978,8 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
 
 MasterService::TenantQuotaEvictionResult
 MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
-                                         uint64_t target_bytes) {
+                                         uint64_t target_bytes,
+                                         size_t max_keys_examined) {
     TenantQuotaEvictionResult total;
     if (!enable_multi_tenants_ || target_bytes == 0) {
         return total;
@@ -9885,7 +9987,13 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
 
     const TenantId normalized_tenant(tenant_id);
     auto now = std::chrono::system_clock::now();
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    // snapshot_mutex_ shared per shard section (see BatchEvict), so a writer
+    // waiting for it exclusively never waits out a whole eviction; HA,
+    // snapshot and CXL modes keep the whole-call hold.
+    std::optional<std::shared_lock<std::shared_mutex>> whole_call;
+    if (!enable_async_segment_cleanup_) {
+        whole_call.emplace(snapshot_mutex_);
+    }
 
     auto is_evictable_memory_replica = [this](const Replica& replica) {
         return IsEvictableMemoryReplica(replica);
@@ -10043,12 +10151,16 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         return result;
     };
 
+    size_t keys_examined = 0;
     auto pass = [&](bool allow_soft_pinned) {
         const size_t start_shard = randomIndex(kNumShards);
         for (size_t scanned = 0;
-             scanned < kNumShards && total.freed_bytes < target_bytes;
+             scanned < kNumShards && total.freed_bytes < target_bytes &&
+             !total.budget_exhausted;
              ++scanned) {
             const size_t shard_idx = (start_shard + scanned) % kNumShards;
+            auto snapshot = whole_call ? std::shared_lock<std::shared_mutex>()
+                                       : LockSnapshotForSection();
             std::vector<std::vector<Replica>> deferred_replicas;
             {
                 MetadataShardAccessorRW shard(this, shard_idx);
@@ -10060,6 +10172,10 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 for (auto it = tenant_state.metadata.begin();
                      it != tenant_state.metadata.end() &&
                      total.freed_bytes < target_bytes;) {
+                    if (++keys_examined > max_keys_examined) {
+                        total.budget_exhausted = true;
+                        break;
+                    }
                     auto& metadata = it->second;
                     if (metadata.IsHardPinned() ||
                         !metadata.IsLeaseExpired(now) ||
@@ -10089,7 +10205,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     };
 
     pass(/*allow_soft_pinned=*/false);
-    if (allow_evict_soft_pinned_objects_ && total.freed_bytes < target_bytes) {
+    if (allow_evict_soft_pinned_objects_ && total.freed_bytes < target_bytes &&
+        !total.budget_exhausted) {
         pass(/*allow_soft_pinned=*/true);
     }
 
@@ -10434,7 +10551,21 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards.
     size_t start_idx = randomIndex(kNumShards);
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    // snapshot_mutex_ is taken shared per shard section, not across the whole
+    // eviction: at production's index a census is seconds long, and a remount
+    // or disk (un)mount waiting for it exclusively holds its RPC IO thread,
+    // starving the Pings of every client on that thread. Every section
+    // re-reads its shard (candidates carry keys, not iterators). HA, snapshot
+    // and CXL modes keep the whole-run hold, so a snapshot never lands
+    // mid-eviction there.
+    std::optional<std::shared_lock<std::shared_mutex>> whole_run;
+    if (!enable_async_segment_cleanup_) {
+        whole_run.emplace(snapshot_mutex_);
+    }
+    auto section = [&] {
+        return whole_run ? std::shared_lock<std::shared_mutex>()
+                         : LockSnapshotForSection();
+    };
 
     // ===== Phase 1: Parallel candidate census =====
     // N threads each scan a batch of shards. For selective ratios only the
@@ -10472,6 +10603,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             size_t s_start = t * shards_per_thread;
             size_t s_end = std::min(s_start + shards_per_thread, kNumShards);
             for (size_t s = s_start; s < s_end; s++) {
+                auto snapshot = section();
                 MetadataShardAccessorRW shard(this, s);
                 DiscardExpiredProcessingReplicas(shard, now);
 
@@ -10581,6 +10713,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 size_t s_end =
                     std::min(s_start + shards_per_thread, kNumShards);
                 for (size_t s = s_start; s < s_end; s++) {
+                    auto snapshot = section();
                     MetadataShardAccessorRW shard(this, s);
                     for (const auto& [tenant_id, tenant_state] :
                          shard->tenants) {
@@ -10691,6 +10824,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     no_pin_objects.push_back(c.lease_timeout);
                     continue;
                 }
+                auto snapshot = section();
                 {
                     MetadataShardAccessorRW shard(this, c.shard_idx);
                     auto tenant_it = shard->tenants.find(c.tenant_id);
@@ -10756,7 +10890,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     // Try releasing discarded replicas before we decide whether to do the
     // second pass.
-    uint64_t released_discarded_cnt = ReleaseExpiredDiscardedReplicas(now);
+    uint64_t released_discarded_cnt = 0;
+    {
+        auto snapshot = section();
+        released_discarded_cnt = ReleaseExpiredDiscardedReplicas(now);
+    }
 
     // The ideal number of objects to evict in the second pass
     long target_evict_num =
@@ -10781,6 +10919,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             // Evict via key lookup — avoid full metadata traversal
             for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
                 const size_t shard_idx = (start_idx + i) % kNumShards;
+                auto snapshot = section();
                 {
                     MetadataShardAccessorRW shard(this, shard_idx);
                     for (auto tenant_it = shard->tenants.begin();
@@ -10844,6 +10983,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
             for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
                 const size_t shard_idx = (start_idx + i) % kNumShards;
+                auto snapshot = section();
                 {
                     MetadataShardAccessorRW shard(this, shard_idx);
 
@@ -10919,6 +11059,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // the map being rehashed, so no live iterator is invalidated.
     for (size_t i = 0; i < kNumShards; i++) {
         if (!evicted_shards.test(i)) continue;
+        auto snapshot = section();
         MetadataShardAccessorRW shard(this, i);
         for (auto& tenant : shard->tenants) {
             ShrinkBucketsIfSparse(tenant.second.metadata);

@@ -999,9 +999,29 @@ class MasterService {
     struct TenantQuotaEvictionResult {
         uint64_t freed_bytes{0};
         uint64_t evicted_objects{0};
+        bool budget_exhausted{false};  // Stopped at max_keys_examined.
     };
+    // A write found its tenant over quota by `deficit_bytes` (this write
+    // included). Evicts inline, examining at most kInlineEvictionKeyBudget
+    // keys: enough for the steady state of a tenant at its quota, and bounded
+    // whatever the tenant looks like (a capacity drop leaving it hundreds of GB
+    // over, or most of its keys under a read lease). If that budget runs out,
+    // hands the demand to the background trim and returns false: the write is
+    // refused (TENANT_QUOTA_EXCEEDED), and its retry finds the room.
+    bool MakeRoomForWrite(const TenantId& tenant_id, uint64_t deficit_bytes);
+    static constexpr size_t kInlineEvictionKeyBudget = 4096;
+    // quota_trim_worker_'s job: evicts every tenant down to its effective
+    // quota, plus what refused writes asked for, a shard at a time.
+    void TrimTenantsOverQuota();
+    // Schedules it if any tenant is over its quota.
+    void ScheduleQuotaTrimIfOver();
+    std::mutex quota_trim_demand_mutex_;  // A leaf.
+    std::unordered_map<TenantId, uint64_t, TenantIdHash> quota_trim_demand_;
+    // Evicts up to target_bytes of the tenant's memory replicas, examining at
+    // most max_keys_examined keys.
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
-        const TenantId& tenant_id, uint64_t target_bytes);
+        const TenantId& tenant_id, uint64_t target_bytes,
+        size_t max_keys_examined = std::numeric_limits<size_t>::max());
 
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
@@ -1044,6 +1064,11 @@ class MasterService {
     // Takes snapshot_mutex_ exclusively, announcing the wait so the cleanup
     // pass steps aside between batches rather than starving the writer.
     std::unique_lock<std::shared_mutex> LockSnapshotExclusive() const;
+    // Takes snapshot_mutex_ shared for one bounded section of a long pass
+    // (a cleanup batch, one shard of an eviction), first stepping aside while
+    // an exclusive writer waits: a remount or disk (un)mount waits for at most
+    // one section, never a whole pass. Never call it holding snapshot_mutex_.
+    std::shared_lock<std::shared_mutex> LockSnapshotForSection() const;
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -2075,6 +2100,11 @@ class MasterService {
     DeadlineScheduler<GracefulUnmountDeadlineRecord>
         graceful_unmount_scheduler_;
     BackgroundWorker replica_cleanup_worker_;
+    // Evicts what tenants hold beyond their effective quota, in the
+    // background: after a capacity drop that is a large share of their
+    // holdings, and doing it inline in one write's RPC (an IO thread) once
+    // stalled every client on that thread past its TTL.
+    BackgroundWorker quota_trim_worker_;
     const bool enable_async_segment_cleanup_;
 
     /**

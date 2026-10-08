@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <chrono>
 #include <future>
 #include <mutex>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include "master_service.h"
+#include "tenant_quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -52,6 +54,27 @@ class MasterLivenessIsolationTest : public ::testing::Test {
         config.client_live_ttl_sec = ttl_sec;
         return std::make_unique<MasterService>(config);
     }
+
+    // Tenant quotas on: `tenant` may hold `quota_bytes`. With lease_ms 0,
+    // objects are evictable as soon as written.
+    static std::unique_ptr<MasterService> MakeQuotaService(
+        const std::string& tenant, uint64_t quota_bytes,
+        uint64_t lease_ms = 0) {
+        TenantQuotaPolicySnapshot policy;
+        policy.tenant_quotas.emplace(tenant, quota_bytes);
+        const std::string path = std::string("/tmp/liveness_quota_") +
+                                 std::to_string(::getpid()) + "_" +
+                                 std::to_string(next_policy_++) + ".yaml";
+        std::ofstream(path) << FormatTenantQuotaPolicyYaml(policy);
+        MasterServiceConfig config;
+        config.default_kv_lease_ttl = lease_ms;
+        config.client_live_ttl_sec = 3600;
+        config.enable_multi_tenants = true;
+        config.tenant_quota_connector_type = "file";
+        config.tenant_quota_connector_uri = path;
+        return std::make_unique<MasterService>(config);
+    }
+    static inline std::atomic<int> next_policy_{0};
 
     // Pings the given clients every 200 ms until destroyed; Drop() stops
     // pinging one of them.
@@ -97,6 +120,59 @@ class MasterLivenessIsolationTest : public ::testing::Test {
         UUID id;
         Segment segment;
     };
+
+    // A memory-only client with one large segment.
+    static Client MountMemoryClient(MasterService& service,
+                                    const std::string& name, size_t base,
+                                    size_t size) {
+        Client client{generate_uuid(), {}};
+        client.segment.id = generate_uuid();
+        client.segment.name = name;
+        client.segment.base = base;
+        client.segment.size = size;
+        client.segment.te_endpoint = name;
+        EXPECT_TRUE(
+            service.MountSegment(client.segment, client.id).has_value());
+        EXPECT_TRUE(
+            service.ReMountSegment({client.segment}, client.id).has_value());
+        return client;
+    }
+
+    static tl::expected<void, ErrorCode> PutIn(MasterService& service,
+                                               const Client& client,
+                                               const std::string& tenant,
+                                               const std::string& key,
+                                               uint64_t size) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto start =
+            service.PutStart(client.id, key, TenantId(tenant), size, config);
+        if (!start) {
+            return tl::make_unexpected(start.error());
+        }
+        auto end = service.PutEnd(client.id, key, TenantId(tenant),
+                                  ReplicaType::MEMORY);
+        if (!end) {
+            return tl::make_unexpected(end.error());
+        }
+        return {};
+    }
+
+    static uint64_t Charged(MasterService& service, const std::string& t) {
+        return service.GetTenantQuotaSnapshot(TenantId(t))->charged_bytes;
+    }
+    static uint64_t Effective(MasterService& service, const std::string& t) {
+        return service.GetTenantQuotaSnapshot(TenantId(t))
+            ->effective_quota_bytes;
+    }
+    static void StopQuotaTrimWorker(MasterService& service) {
+        service.quota_trim_worker_.Stop();
+    }
+    static void TrimNow(MasterService& service) {
+        service.TrimTenantsOverQuota();
+    }
+    static constexpr size_t kInlineBudget =
+        MasterService::kInlineEvictionKeyBudget;
 
     // Mounts a memory segment and a LOCAL_DISK segment, then remounts once
     // the way a client answering its first NEED_REMOUNT Ping does, so the
@@ -926,6 +1002,129 @@ TEST_F(MasterLivenessIsolationTest, ExpiryWithoutSegmentsStillReclaims) {
     auto ping = service->Ping(x.id);
     ASSERT_TRUE(ping.has_value());
     EXPECT_EQ(ping->client_status, ClientStatus::NEED_REMOUNT);
+}
+
+// A tenant far over its quota (after a capacity drop or a lowered quota) is
+// not trimmed inside a write's RPC: on eu-west1 one Put evicted a 519k-object
+// shortfall inline, holding its RPC IO thread for 33 s, and the clients on
+// that thread expired. The write examines at most kInlineEvictionKeyBudget
+// keys and is refused; the background trim evicts the shortfall; the retry
+// succeeds.
+TEST_F(MasterLivenessIsolationTest, LargeQuotaOverageIsTrimmedNotInline) {
+    constexpr uint64_t kKiB = 1 << 10;
+    auto service = MakeQuotaService("trim", 4ULL << 30);
+    auto a = MountMemoryClient(*service, "trim_a", 0x100000000, 4ULL << 30);
+    for (int i = 0; i < 20000; ++i) {
+        ASSERT_TRUE(
+            PutIn(*service, a, "trim", "trim_" + std::to_string(i), 64 * kKiB));
+    }
+    StopQuotaTrimWorker(*service);  // Only the write path, deterministically.
+    ASSERT_TRUE(
+        service->UpsertTenantQuotaPolicy(TenantId("trim"), 64ULL << 20));
+    const uint64_t before = Charged(*service, "trim");
+    tl::expected<void, ErrorCode> refused;
+    const auto took = Time(
+        [&] { refused = PutIn(*service, a, "trim", "trim_new", 64 * kKiB); });
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
+    // At most the budget's worth of objects, on each of the write's attempts.
+    EXPECT_GE(Charged(*service, "trim"),
+              before - 3 * kInlineBudget * 64 * kKiB);
+    EXPECT_LT(took.count(), 1000);
+
+    TrimNow(*service);
+    EXPECT_LE(Charged(*service, "trim"), Effective(*service, "trim"));
+    EXPECT_TRUE(PutIn(*service, a, "trim", "trim_new", 64 * kKiB).has_value());
+}
+
+// The same bound when nothing is evictable: a tenant at its quota whose keys
+// are all under a read lease no longer has one write scan all of them.
+TEST_F(MasterLivenessIsolationTest, WriteToLeasedTenantIsRefusedQuickly) {
+    constexpr uint64_t kKiB = 1 << 10;
+    auto service = MakeQuotaService("leased", 400000 * 4 * kKiB,
+                                    /*lease_ms=*/600000);
+    auto a = MountMemoryClient(*service, "leased_a", 0x100000000, 4ULL << 30);
+    for (int i = 0; i < 400000; ++i) {
+        ASSERT_TRUE(PutIn(*service, a, "leased", "leased_" + std::to_string(i),
+                          4 * kKiB));
+        // Read: a lease, so it is not evictable.
+        ASSERT_TRUE(service->ExistKey("leased_" + std::to_string(i),
+                                      TenantId("leased")));
+    }
+    StopQuotaTrimWorker(*service);
+    tl::expected<void, ErrorCode> refused;
+    const auto took = Time([&] {
+        refused = PutIn(*service, a, "leased", "leased_new", 4 * kKiB);
+    });
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
+    LOG(INFO) << "refused after " << took.count() << " ms";
+    EXPECT_LT(took.count(), 200);
+}
+
+// The steady state is unchanged: a tenant at its quota makes room for one
+// more write inline.
+TEST_F(MasterLivenessIsolationTest, WriteAtQuotaStillEvictsInline) {
+    constexpr uint64_t kMiB = 1 << 20;
+    auto service = MakeQuotaService("steady", 64 * kMiB);
+    auto a = MountMemoryClient(*service, "steady_a", 0x100000000, 1024 * kMiB);
+    for (int i = 0; i < 64; ++i) {
+        ASSERT_TRUE(
+            PutIn(*service, a, "steady", "steady_" + std::to_string(i), kMiB));
+    }
+    StopQuotaTrimWorker(*service);
+    EXPECT_TRUE(PutIn(*service, a, "steady", "steady_more", kMiB).has_value());
+    EXPECT_LE(Charged(*service, "steady"), 64 * kMiB);
+}
+
+// A remount (an exclusive snapshot writer, on its RPC IO thread) waits for at
+// most one shard section of a long eviction, never the whole of it: the quota
+// trim and BatchEvict take snapshot_mutex_ per shard and step aside.
+TEST_F(MasterLivenessIsolationTest, RemountDoesNotWaitOutAnEviction) {
+    constexpr uint64_t kKiB = 1 << 10;
+    for (const bool batch_evict : {false, true}) {
+        auto service = MakeQuotaService("big", 1ULL << 40);
+        auto a =
+            MountMemoryClient(*service, "evict_a", 0x100000000, 8ULL << 30);
+        auto b = MountMemoryClient(*service, "evict_b", 0x400000000, 1 << 26);
+        for (int i = 0; i < 400000; ++i) {
+            ASSERT_TRUE(PutIn(*service, a, "big", "big_" + std::to_string(i),
+                              4 * kKiB));
+        }
+        StopQuotaTrimWorker(*service);
+        ASSERT_TRUE(service->UpsertTenantQuotaPolicy(TenantId("big"), kKiB));
+
+        std::atomic<bool> started{false};
+        Clock::time_point pass_end;
+        auto pass = std::async(std::launch::async, [&] {
+            started = true;
+            if (batch_evict) {
+                service->RunBatchEvictForTesting(1.0, 1.0);
+            } else {
+                TrimNow(*service);
+            }
+            pass_end = Clock::now();
+        });
+        while (!started) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(milliseconds(30));  // Into its shards.
+        const auto remount_started = Clock::now();
+        const auto remount = Time(
+            [&] { ASSERT_TRUE(service->ReMountSegment({b.segment}, b.id)); });
+        ASSERT_EQ(pass.wait_for(std::chrono::seconds(120)),
+                  std::future_status::ready);
+        const auto left = std::chrono::duration_cast<milliseconds>(
+            pass_end - remount_started);
+        LOG(INFO) << (batch_evict ? "BatchEvict" : "quota trim")
+                  << ": remount_ms=" << remount.count()
+                  << " eviction_left_when_remount_started_ms=" << left.count();
+        if (left.count() < 100) {
+            continue;  // Too little of the eviction left to tell.
+        }
+        EXPECT_LT(remount.count(), left.count() / 2)
+            << "the remount waited out the eviction";
+    }
 }
 
 // The scale shape of the incident, in process: a client with many LOCAL_DISK
