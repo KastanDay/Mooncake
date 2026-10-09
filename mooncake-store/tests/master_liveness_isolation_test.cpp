@@ -57,9 +57,9 @@ class MasterLivenessIsolationTest : public ::testing::Test {
 
     // Tenant quotas on: `tenant` may hold `quota_bytes`. With lease_ms 0,
     // objects are evictable as soon as written.
-    static std::unique_ptr<MasterService>
-    MakeQuotaService(const std::string &tenant, uint64_t quota_bytes,
-                     uint64_t lease_ms = 0, bool offload_on_evict = false) {
+    static std::unique_ptr<MasterService> MakeQuotaService(
+        const std::string& tenant, uint64_t quota_bytes, uint64_t lease_ms = 0,
+        bool offload_on_evict = false) {
         TenantQuotaPolicySnapshot policy;
         policy.tenant_quotas.emplace(tenant, quota_bytes);
         const std::string path = std::string("/tmp/liveness_quota_") +
@@ -72,10 +72,10 @@ class MasterLivenessIsolationTest : public ::testing::Test {
         config.enable_multi_tenants = true;
         config.tenant_quota_connector_type = "file";
         config.tenant_quota_connector_uri = path;
-        if (offload_on_evict) { // As on eu-west1.
-          config.enable_offload = true;
-          config.offload_on_evict = true;
-          config.offload_force_evict = true;
+        if (offload_on_evict) {  // As on eu-west1.
+            config.enable_offload = true;
+            config.offload_on_evict = true;
+            config.offload_force_evict = true;
         }
         return std::make_unique<MasterService>(config);
     }
@@ -312,7 +312,7 @@ class MasterLivenessIsolationTest : public ::testing::Test {
         return std::make_unique<MasterService::MetadataShardAccessorRW>(
             &service, ShardOf(service, key));
     }
-    static auto LockShardAt(MasterService &service, size_t shard) {
+    static auto LockShardAt(MasterService& service, size_t shard) {
         return std::make_unique<MasterService::MetadataShardAccessorRW>(
             &service, shard);
     }
@@ -1122,11 +1122,11 @@ TEST_F(MasterLivenessIsolationTest, QueuedOffloadsAreProgress) {
     }
     StopQuotaTrimWorker(*service);
     auto queued = [&] {
-      auto tasks = service->OffloadObjectHeartbeat(a.id, true);
-      EXPECT_TRUE(tasks.has_value());
-      return tasks ? tasks->size() : 0;
+        auto tasks = service->OffloadObjectHeartbeat(a.id, true);
+        EXPECT_TRUE(tasks.has_value());
+        return tasks ? tasks->size() : 0;
     };
-    ASSERT_EQ(queued(), 0u); // At its quota: nothing evicted yet.
+    ASSERT_EQ(queued(), 0u);  // At its quota: nothing evicted yet.
 
     // Over by one object, and every candidate is memory-only: the passes
     // queue offloads and free nothing, so the write is refused.
@@ -1157,19 +1157,19 @@ TEST_F(MasterLivenessIsolationTest, InlineEvictionDoesNotTrailAShardWalk) {
     StopQuotaTrimWorker(*service);
 
     std::atomic<bool> stop{false};
-    std::thread walker([&] { // A shard walk: each shard for 1 ms, again.
-      while (!stop) {
-        for (size_t i = 0; i < kShards && !stop; ++i) {
-          auto shard = LockShardAt(*service, i);
-          std::this_thread::sleep_for(milliseconds(1));
+    std::thread walker([&] {  // A shard walk: each shard for 1 ms, again.
+        while (!stop) {
+            for (size_t i = 0; i < kShards && !stop; ++i) {
+                auto shard = LockShardAt(*service, i);
+                std::this_thread::sleep_for(milliseconds(1));
+            }
         }
-      }
     });
     const auto took = Time([&] {
-      for (int i = 0; i < 10; ++i) {
-        EXPECT_FALSE(PutIn(*service, a, "trail",
-                           "trail_new_" + std::to_string(i), 64 * kKiB));
-      }
+        for (int i = 0; i < 10; ++i) {
+            EXPECT_FALSE(PutIn(*service, a, "trail",
+                               "trail_new_" + std::to_string(i), 64 * kKiB));
+        }
     });
     stop = true;
     walker.join();
