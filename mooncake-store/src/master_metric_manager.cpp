@@ -720,6 +720,7 @@ int64_t MasterMetricManager::get_segment_total_mem_capacity(
 void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
     mem_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     mem_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
+    KvChurnMetrics::instance().RemoveStore(segment);
 }
 
 // NoF segment Metrics

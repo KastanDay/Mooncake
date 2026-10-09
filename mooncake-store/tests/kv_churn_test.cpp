@@ -583,4 +583,144 @@ TEST_F(KvChurnTest, BatchGetSpanCountsChunks) {
     }
 }
 
+// A rewrite of a lost object can reclaim it before the cleanup pass does
+// (the hottest objects come back first). The drop is still recorded, with
+// the heat it had.
+TEST_F(KvChurnTest, RewriteOfLostObjectRecordsTheDrop) {
+    MasterService service(Config(/*colocate=*/false, /*metrics=*/true));
+    StopCleanupWorker(service);
+    const UUID doomed = generate_uuid();
+    const UUID survivor = generate_uuid();
+    auto chunks =
+        MountStore(service, doomed, "store-x", 0x100000000, 1, 64 * kMiB);
+    PutAndEnd(service, doomed, "rewritten", 4096);
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE(service.GetReplicaList("rewritten", TenantId::Default())
+                        .has_value());
+    }
+    MountStore(service, survivor, "store-y", 0x200000000, 1, 64 * kMiB);
+    const std::vector<std::string> drop{"cause=\"unmount\"", "heat=\"3\""};
+    const double drops = Metric("master_kv_churn_drops_total", drop);
+    ASSERT_TRUE(service.UnmountSegment(chunks[0].id, doomed).has_value());
+
+    ASSERT_TRUE(Put(service, survivor, "rewritten", 4096, nullptr).has_value());
+    EXPECT_EQ(Metric("master_kv_churn_drops_total", drop) - drops, 1);
+}
+
+// The slot of a slice that aged out is reset before it is reused.
+TEST_F(KvChurnTest, MissFilterReusesAnAgedOutSlice) {
+    ChurnMissFilter filter(seconds(60), /*slice_capacity=*/4);
+    const auto t0 = Clock::time_point(seconds(6000));
+    const uint64_t old_key = ChurnKeyHash("default", "old");
+    const uint64_t new_key = ChurnKeyHash("default", "new");
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(filter.Insert(ChurnKeyHash("default", std::to_string(i)),
+                                  ChurnCause::kUnmount, 0, t0));
+    }
+    EXPECT_FALSE(filter.Insert(old_key, ChurnCause::kUnmount, 0, t0));
+    // Six slices later the same slot holds a new slice: empty again.
+    const auto t1 = t0 + seconds(60);
+    ASSERT_TRUE(filter.Insert(new_key, ChurnCause::kClientExpiry, 2, t1));
+    EXPECT_FALSE(filter.Find(ChurnKeyHash("default", "0"), t1).has_value());
+    auto hit = filter.Find(new_key, t1);
+    ASSERT_TRUE(hit.has_value());
+    EXPECT_EQ(hit->cause, ChurnCause::kClientExpiry);
+    EXPECT_EQ(hit->age_slice, 0u);
+}
+
+// A local disk unmount: an object that keeps its memory copy is degraded,
+// a disk-only one is dropped, both attributed to disk_unmount.
+TEST_F(KvChurnTest, DiskUnmountDegradesOrDrops) {
+    auto config = Config(/*colocate=*/false, /*metrics=*/true);
+    config.enable_offload = true;
+    MasterService service(config);
+    StopCleanupWorker(service);
+    const UUID client = generate_uuid();
+    auto chunks =
+        MountStore(service, client, "store-d", 0x100000000, 1, 64 * kMiB);
+    ASSERT_TRUE(service.MountLocalDiskSegment(client, true).has_value());
+    ASSERT_TRUE(service.ReportSsdCapacity(client, 1 << 30).has_value());
+    ASSERT_TRUE(service.ReMountSegment({chunks[0]}, client).has_value());
+    PutAndEnd(service, client, "both", 1024);
+    auto offload = [&](const std::string& key) {
+        StorageObjectMetadata metadata;
+        metadata.data_size = 1024;
+        metadata.transport_endpoint = "store-d";
+        OffloadTaskItem task{
+            .tenant_id = TenantId::Default().value(), .key = key, .size = 1024};
+        return service.NotifyOffloadSuccess(client, {task}, {metadata});
+    };
+    ASSERT_TRUE(offload("both").has_value());
+    ASSERT_TRUE(offload("disk-only").has_value());
+
+    const double degraded =
+        Metric("master_kv_churn_degraded_total", {"cause=\"disk_unmount\""});
+    const double drops =
+        Metric("master_kv_churn_drops_total", {"cause=\"disk_unmount\""});
+    ASSERT_TRUE(service.UnmountLocalDiskSegment(client).has_value());
+    RunCleanup(service);
+    EXPECT_EQ(
+        Metric("master_kv_churn_degraded_total", {"cause=\"disk_unmount\""}) -
+            degraded,
+        1);
+    EXPECT_EQ(
+        Metric("master_kv_churn_drops_total", {"cause=\"disk_unmount\""}) -
+            drops,
+        1);
+    EXPECT_TRUE(service.ExistKey("both", TenantId::Default()).value());
+    EXPECT_FALSE(service.ExistKey("disk-only", TenantId::Default()).value());
+}
+
+// With two memory replicas, the first goes next to the anchor and the second
+// to another Store.
+TEST_F(KvChurnTest, SecondReplicaAvoidsTheAnchorStore) {
+    MasterService service(Config(/*colocate=*/true, /*metrics=*/false));
+    std::vector<Segment> chunks;
+    const std::vector<std::string> names{"store-1", "store-2", "store-3"};
+    for (size_t s = 0; s < names.size(); ++s) {
+        auto store = MountStore(service, generate_uuid(), names[s],
+                                0x100000000 * (s + 1), 3, 64 * kMiB);
+        chunks.insert(chunks.end(), store.begin(), store.end());
+    }
+    auto placement = service.BeginBatchPlacement();
+    std::set<int> first_chunks;
+    for (int i = 0; i < 12; ++i) {
+        ReplicateConfig config;
+        config.replica_num = 2;
+        auto result = service.PutStart(
+            generate_uuid(), "two-" + std::to_string(i), TenantId::Default(),
+            256 * 1024, config, &*placement);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result->size(), 2u);
+        const int first = ChunkOf(chunks, {result->at(0)});
+        const int second = ChunkOf(chunks, {result->at(1)});
+        ASSERT_GE(first, 0);
+        ASSERT_GE(second, 0);
+        EXPECT_NE(first / 3, second / 3);  // different Stores
+        first_chunks.insert(first);
+    }
+    EXPECT_EQ(first_chunks.size(), 1u);
+}
+
+// Served reads count against the Store holding them; the label goes when
+// the Store's segments unmount.
+TEST_F(KvChurnTest, ReadBytesAreCountedPerStore) {
+    MasterService service(Config(/*colocate=*/false, /*metrics=*/true));
+    const UUID client = generate_uuid();
+    auto chunks =
+        MountStore(service, client, "store-r", 0x100000000, 1, 64 * kMiB);
+    std::vector<std::string> keys{"r0", "r1", "r2"};
+    for (const auto& key : keys) PutAndEnd(service, client, key, 4096);
+    const std::vector<std::string> label{"segment=\"store-r\""};
+    const double before = Metric("master_kv_store_read_bytes_total", label);
+    service.BatchGetReplicaList(keys, TenantId::Default());
+    EXPECT_EQ(Metric("master_kv_store_read_bytes_total", label) - before,
+              3 * 4096);
+    ASSERT_TRUE(service.GetReplicaList("r0", TenantId::Default()).has_value());
+    EXPECT_EQ(Metric("master_kv_store_read_bytes_total", label) - before,
+              4 * 4096);
+    ASSERT_TRUE(service.UnmountSegment(chunks[0].id, client).has_value());
+    EXPECT_EQ(Metric("master_kv_store_read_bytes_total", label), 0);
+}
+
 }  // namespace mooncake::test
