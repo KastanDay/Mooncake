@@ -6,6 +6,241 @@ python.cfdata.org. Newest first. Each entry is a GitLab release tagged
 `wheel-<version>` on the wheels' source commit; the version is the build's UTC
 start time, `YY.MDD.HMMSS`.
 
+## wheel-v0.3.13.post1+26.1009.65649 (2026-10-09)
+
+Master: keep client liveness independent of metadata cleanup.
+
+On eu-west1 (2026-10-08, about 13.8M keys), one elastic Store's disk unmount
+flushed the whole cache:
+
+1. `UnmountLocalDiskSegment` walked every metadata shard inside its RPC handler
+   for 58 s. Synchronous coro_rpc handlers run on their connection's IO thread,
+   so that walk held the thread and starved every connection sharing it.
+2. A client on that thread missed its Pings and expired.
+3. Its expiry swept the whole index again on the client-monitor thread, holding
+   `snapshot_mutex_` shared throughout.
+4. The expired, still-alive client remounted. `ReMountSegment` took
+   `client_mutex_` exclusively and then waited for `snapshot_mutex_`.
+5. Every Ping, and every Put/Upsert/batch call, needed `client_mutex_` shared,
+   so they all waited behind that remount and all 75 clients expired at once.
+6. The mass expiry then erased all 13.8M keys while holding shard locks, for
+   about 2 minutes.
+
+The defect was that liveness depended on O(total keys) metadata cleanup, run
+inline on threads and under locks that liveness also needed. At 1 PiB of SSD
+(0.5 to 1 billion keys), one Store crash would have frozen the Master for tens
+of minutes.
+
+The change is Master only: no client, protocol or flag change, and the 10-s
+client TTL stays. Three mechanisms:
+
+- **Pings never wait.**
+  - `Ping` records receipt in a liveness table under a leaf mutex. Nothing
+    holds that mutex while waiting for another lock.
+  - The table is the only record of a client's status; `ok_client_` is gone.
+  - The monitor reads the table and revalidates each expiry under the locks:
+    a client that pinged since it was selected stays.
+  - Lock order is `snapshot_mutex_`, then `client_mutex_`, then the leaf.
+    Remount takes the snapshot lock first, so nothing holds `client_mutex_`
+    while it waits. The data paths no longer take `client_mutex_` at all.
+- **A replica's validity is checked in O(1) when it is read, and is
+  monotone.**
+  - Each LOCAL_DISK replica is bound to the disk-registration generation it
+    was admitted under. It is servable only while that generation is current.
+  - Generations are never reused, and 0 (bound to none) is never current. So
+    once a replica is invalid it stays invalid: a later registration under
+    the same client id cannot resurrect it.
+  - A snapshot restore binds each restored replica to its owner's restored
+    registration and credits its bytes there, as a live admission does.
+  - An owner that reports a key again under a new registration rebinds its
+    completed replica in place (HA keeps the old replica until its removal is
+    durable; one already marked for removal is left to go).
+  - A promoted HA standby has no SSD registry to bind against, so its disk
+    replicas serve nothing until each owner re-registers and rescans. That is
+    the price of monotonicity, in a mode eu-west1 does not run.
+  - Used bytes are credited and debited per registration.
+- **Cleanup is background garbage collection.**
+  - Disk unmount and client expiry retire the registration or segment in
+    O(that client's segments) and schedule the coalescing cleanup worker.
+    Every expiry schedules one.
+  - The worker visits at most about 256 keys per lock hold, taking
+    `snapshot_mutex_` shared and one shard lock per batch.
+  - It resumes from a bucket cursor and restarts a tenant if its map was
+    rehashed, which is rare.
+  - It steps aside whenever an exclusive writer, such as a remount or a disk
+    unmount, is waiting.
+  - HA, snapshot and CXL modes keep their synchronous sweeps, with the same
+    predicate.
+
+- **No RPC handler does unbounded eviction, and no long pass holds the
+  snapshot lock.** A live A/B on eu-west1 (23M keys, 76 clients) found the
+  same failure through a second path:
+  - After a capacity drop, a tenant's quota collapses below what it holds.
+    Its next Put evicted the whole shortfall inline, on its RPC IO thread:
+    519k objects over 33 s.
+  - `BatchEvict` held `snapshot_mutex_` shared for its whole run, so remounts
+    and disk mounts waited out the run on their IO threads.
+  - Crashing all three test Stores at once expired all 76 clients.
+
+  Now:
+  - A write's inline eviction examines at most 4,096 keys (and 65,536
+    buckets), for at most 20 ms. A pass that freed memory or queued offloads
+    made progress, and the write retries.
+  - The pass checks its deadline per shard as well as per 32 keys. Behind
+    the trim's shard walk, a pass for a tenant with few keys per shard
+    examined almost nothing and so never checked it. After three Stores
+    crashed in the A/B, all sixteen RPC threads trailed the trim for up to
+    12 s and 48 clients expired.
+  - A pass that ran out of budget with neither refuses the write
+    (`quota_trimming`). Its own size goes to a background quota-trim worker,
+    and its RPC thread refuses that tenant's writes for the next 100 ms
+    without scanning.
+  - A tenant over by more than its whole quota (and at least 256 MiB) is
+    refused at once.
+  - The worker trims every tenant with a policy down to its quota, plus what
+    refused writes asked for, whenever capacity or a policy changes.
+  - `BatchEvict`, the quota eviction and the cleanup pass take the snapshot
+    lock per shard section, and step aside while a writer waits. HA, snapshot
+    and CXL modes keep their whole-run holds, so a snapshot never lands
+    mid-eviction there.
+  - Tenants without an explicit policy (orphan state) are never trimmed, as
+    before.
+  - The quota eviction walks each shard from a random bucket. Evicted keys
+    that keep a disk replica stay in place, so a walk from the start
+    re-examined a growing run of keys that free nothing on every write. In
+    the A/B that refused 29k writes during a disk-heavy spill.
+  - With offload-on-evict, a pass over memory-only objects queues their
+    offloads and frees nothing until they land. Reading that as "nothing
+    evictable" stopped the inline passes that fill the offload queue, and
+    refused 1.7M of a spill's writes.
+  - A slow inline eviction logs `inline_quota_eviction_slow`. The
+    per-eviction `[TENANT-EVICT]` warnings and per-key batch refusals log
+    every 1000th: they ran at about 1,800 lines/s from the RPC threads.
+  - After a census that found nothing evictable, `BatchEvict` waits a second
+    before the next. At zero capacity every refused write used to trigger a
+    full census every 10 ms.
+
+- **Stalls can be attributed.** A synchronous RPC over 500 ms logs
+  `action=rpc_slow` with its name. An exclusive `snapshot_mutex_` wait or
+  hold over 100 ms logs `action=snapshot_exclusive_wait_slow` or
+  `..._hold_slow`, with the caller.
+
+- **The Stores' batch RPCs leave the IO threads.** `BatchEvictDiskReplica`
+  and `NotifyOffloadSuccess` run on serial workers (sixteen, as the RPC
+  threads) chosen by connection, and answer through `coro_rpc::context`.
+  - A disk watermark eviction is a single call: in the A/B, 497,445 keys
+    held an IO thread for 10.4 s, and two clients whose Pings queued behind
+    it expired.
+  - Each connection's calls keep their order and connections run in
+    parallel, as on the IO threads. Ordering all of a Store's calls on one
+    worker slowed its offload notices: a spill was refused 1.24M times.
+  - They are registered under the synchronous methods' route keys, so the
+    wire is unchanged.
+
+Also:
+- Only a servable disk replica counts as an eviction backup or a promotion
+  source, and a promotion task reaches only its registration's mailbox.
+- Admission re-checks the generation under the shard lock, so a replica racing
+  a retirement is refused rather than published behind the cleanup pass.
+- The cleanup plan builds surviving descriptors only when the HA oplog needs
+  them, and the `get_descriptor` error is rate-limited (27,432 lines in one
+  minute during the incident, under shard locks).
+
+Reviews:
+- a critical design review and two implementation reviews by Codex
+  (GPT-6-astra);
+- a design review and implementation audit by Claude (Fable 5.1). Its
+  simplifications went in: monotone generations replace a special sweep for
+  restored replicas, and there is one record of client status.
+
+Tests: new `master_liveness_isolation_test` (28 tests and a benchmark). It
+covers each link of the incident chain, and these regressions:
+- re-registration and restore;
+- admission racing retirement;
+- eviction and promotion against ended registrations;
+- the offload-disabled path;
+- rehash and yield in the cleanup pass.
+Each test fails without the change it covers.
+
+eu-west1 A/B (an isolated test Master in staging, 3 test Stores, a 72-client
+swarm, production's key and client counts): on production's wheel every
+scenario failed, with Pings at 0/s and Master-only calls stalled 19 to 30 s.
+On this wheel, 35 scenarios had 0 collateral expiries and 0 corrupt reads:
+- the incident replay, disk unmounts, client and Store freezes, single and
+  triple Store crashes, and their repeats;
+- a 12-minute soak with all Stores resizing every 20 s;
+- 2x the keys (52M);
+- a Master restart.
+Worst Master-only call 4.3 s, against the 10-s client TTL.
+
+The existing Master suites pass. Three tests encoded the old semantics and
+were adapted:
+- one expected a never-remounted owner's disk replica to be stale;
+- one called the removed owner-targeted sweep;
+- the manager tests now name the registration they credit.
+
+What this does not fix: other handlers still run on the RPC IO threads that
+carry Pings. Every known long hold is now bounded, but a new unbounded handler
+would starve its thread's clients again. `GetReplicaListByRegex`,
+`RemoveByRegex` and `RemoveAll` still scan the whole index inline; do not call
+them on a large index.
+
+Deferred, as gates before the index grows well past today's:
+- moving the remaining handlers off the IO threads (defence in depth);
+- an owner-to-replica index, so reclamation is targeted (today a pass costs
+  about 10 s at 14M keys and grows linearly);
+- a lock-free published generation map for the read path;
+- reclaiming a hot key's dead disk replica when it is accessed;
+- parallel quota trimming across shards, if a trim after a large capacity drop takes minutes;
+- recoverable client suspicion.
+
+### Artifacts
+
+Version `0.3.13.post1+26.1009.65649` (built 2026-10-09 06:56:49 UTC) from `41d402276e4c6678295440aa98e15acb03b009b5` on `kastan/wheel`.
+Builder images: non-cuda: `pytorch/manylinux2_28-builder:cuda12.8`. CPython 3.12, x86_64.
+
+| Variant | File | sha256 | Registry |
+|---|---|---|---|
+| non-cuda | `mooncake_transfer_engine_non_cuda-0.3.13.post1+26.1009.65649-cp312-cp312-manylinux_2_28_x86_64.whl` | `6dc7ae963cf14b98c873c0c518ea2b5fc9edc2e0960d9fc51dfde2a708621cc3` | [https://python.cfdata.org/project/mooncake-transfer-engine-non-cuda/files/…](https://python.cfdata.org/project/mooncake-transfer-engine-non-cuda/files/mooncake_transfer_engine_non_cuda-0.3.13.post1+26.1009.65649-cp312-cp312-manylinux_2_28_x86_64.whl) |
+
+Pin (mooncake-helm `mooncake-shared-cache` values; pods get `PYTHON_REGISTRY` from
+the `cf-python-registry` Secret):
+
+```yaml
+  master.package: "${PYTHON_REGISTRY}/project/mooncake-transfer-engine-non-cuda/files/mooncake_transfer_engine_non_cuda-0.3.13.post1+26.1009.65649-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=6dc7ae963cf14b98c873c0c518ea2b5fc9edc2e0960d9fc51dfde2a708621cc3"
+```
+
+### Commits since v0.3.13.post1
+
+- `431e70ef` [Store] Unregister a segment's memory when its mount fails (Kastan Day)
+- `57d1b314` Add additive successful-read source receipts to Store clients (Kastan Day)
+- `598eeac7` Distinguish observed replica eviction from surviving servable metadata (Kastan Day)
+- `1f4ce545` Record wheel-26.1006.215531 in the changelog (Kastan Day)
+- `5c120b67` [Store] Keep Master client liveness independent of metadata cleanup (Kastan Day)
+- `28edeb72` [Store] Close the gaps an implementation review found (Kastan Day)
+- `7d7cd076` [Store] Fence promotion enqueue and expiry's deadline cleanup (Kastan Day)
+- `ad44146a` Record wheel-26.1008.43949 in the changelog (Kastan Day)
+- `294ed5a4` [Store] Make disk-replica validity monotone; one record of client status (Kastan Day)
+- `8f86e3ea` [Store] Rebind only a completed disk replica on re-adoption (Kastan Day)
+- `5644d1f9` Record wheel-26.1008.65205 in the changelog (Kastan Day)
+- `7a5f072e` [Store] Bound inline quota eviction; no eviction pass holds the snapshot lock (Kastan Day)
+- `d208dfb3` Record wheel-26.1008.202747 in the changelog (Kastan Day)
+- `1e3e5fe1` [Store] Walk quota eviction from a random bucket; quiet routine trims (Kastan Day)
+- `317da539` [Store] Format the quota eviction walk (Kastan Day)
+- `1fc4dd95` Record wheel-26.1008.211229 in the changelog (Kastan Day)
+- `fe3310b8` [Store] Refuse writes to far-over tenants without scanning; quieter evictions (Kastan Day)
+- `b29e8e9c` [Store] Trim only what refused writes add; bound batches; no empty-census loop (Kastan Day)
+- `947d58f7` [Store] Bound inline quota eviction by time as well as keys (Kastan Day)
+- `90a89aca` [Store] Sum refused writes' demand for the quota trim (Kastan Day)
+- `fdbac9a7` [Store] Log slow RPCs and slow exclusive snapshot waits and holds (Kastan Day)
+- `d97c307e` [Store] Keep busy tenants' writes inline; refuse only collapsed quotas (Kastan Day)
+- `858be0a8` [Store] Cap the quota eviction's bucket visits separately from its keys (Kastan Day)
+- `2b3744bc` [Store] Count queued offloads as quota-eviction progress (Kastan Day)
+- `d2730429` [Store] Keep the inline quota eviction to its deadline between shards (Kastan Day)
+- `205af36e` [Store] Format the last two quota-eviction changes (Kastan Day)
+- `f1c14eb5` [Store] Serve the Stores' batch RPCs off the RPC IO threads (Kastan Day)
+- `41d40227` [Store] Order the Stores' batch RPCs per connection, not per client (Kastan Day)
+
 ## wheel-26.1008.211229 (2026-10-08)
 
 Master: keep client liveness independent of metadata cleanup.
