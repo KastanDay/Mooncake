@@ -1000,6 +1000,10 @@ class MasterService {
         uint64_t freed_bytes{0};
         uint64_t evicted_objects{0};
         bool budget_exhausted{false};  // Stopped at max_keys_examined.
+        // Objects queued for disk offload (offload_on_evict): their memory is
+        // freed once the offload lands, so a pass that only queued is still
+        // progress, not a tenant with nothing evictable.
+        uint64_t offloads_queued{0};
     };
     // A write found its tenant over quota by `deficit_bytes` (this write
     // included). Evicts inline, examining at most kInlineEvictionKeyBudget

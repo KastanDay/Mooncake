@@ -57,9 +57,9 @@ class MasterLivenessIsolationTest : public ::testing::Test {
 
     // Tenant quotas on: `tenant` may hold `quota_bytes`. With lease_ms 0,
     // objects are evictable as soon as written.
-    static std::unique_ptr<MasterService> MakeQuotaService(
-        const std::string& tenant, uint64_t quota_bytes,
-        uint64_t lease_ms = 0) {
+    static std::unique_ptr<MasterService>
+    MakeQuotaService(const std::string &tenant, uint64_t quota_bytes,
+                     uint64_t lease_ms = 0, bool offload_on_evict = false) {
         TenantQuotaPolicySnapshot policy;
         policy.tenant_quotas.emplace(tenant, quota_bytes);
         const std::string path = std::string("/tmp/liveness_quota_") +
@@ -72,6 +72,11 @@ class MasterLivenessIsolationTest : public ::testing::Test {
         config.enable_multi_tenants = true;
         config.tenant_quota_connector_type = "file";
         config.tenant_quota_connector_uri = path;
+        if (offload_on_evict) { // As on eu-west1.
+          config.enable_offload = true;
+          config.offload_on_evict = true;
+          config.offload_force_evict = true;
+        }
         return std::make_unique<MasterService>(config);
     }
     static inline std::atomic<int> next_policy_{0};
@@ -1092,6 +1097,39 @@ TEST_F(MasterLivenessIsolationTest, RefusedWritesDemandsAdd) {
                           "demand_new_" + std::to_string(i), 64 * kKiB)
                         .has_value());
     }
+}
+
+// With offload_on_evict, a pass over memory-only objects queues their
+// offloads and frees nothing until they land. That is progress, not a tenant
+// with nothing evictable: the next write still runs its own pass (queuing
+// more, until the queue fills and eviction is forced) rather than being
+// refused unscanned for 100 ms. On eu-west1 that refused a spill 1.7M times.
+TEST_F(MasterLivenessIsolationTest, QueuedOffloadsAreProgress) {
+    constexpr uint64_t kKiB = 1 << 10;
+    constexpr int kKeys = 20000;
+    auto service = MakeQuotaService("spill", kKeys * 4 * kKiB, /*lease_ms=*/0,
+                                    /*offload_on_evict=*/true);
+    auto a = MountMemoryClient(*service, "spill_a", 0x100000000, 1ULL << 30);
+    ASSERT_TRUE(service->MountLocalDiskSegment(a.id, true).has_value());
+    for (int i = 0; i < kKeys; ++i) {
+        ASSERT_TRUE(PutIn(*service, a, "spill", "spill_" + std::to_string(i),
+                          4 * kKiB));
+    }
+    StopQuotaTrimWorker(*service);
+    auto queued = [&] {
+      auto tasks = service->OffloadObjectHeartbeat(a.id, true);
+      EXPECT_TRUE(tasks.has_value());
+      return tasks ? tasks->size() : 0;
+    };
+    ASSERT_EQ(queued(), 0u); // At its quota: nothing evicted yet.
+
+    // Over by one object, and every candidate is memory-only: the passes
+    // queue offloads and free nothing, so the write is refused.
+    EXPECT_FALSE(PutIn(*service, a, "spill", "spill_new_0", 4 * kKiB));
+    EXPECT_GT(queued(), 0u);
+    // The next write, on the same thread and at once, queues more.
+    EXPECT_FALSE(PutIn(*service, a, "spill", "spill_new_1", 4 * kKiB));
+    EXPECT_GT(queued(), 0u);
 }
 
 // The steady state is unchanged: a tenant at its quota makes room for one

@@ -1553,8 +1553,12 @@ bool MasterService::MakeRoomForWrite(const TenantId& tenant_id,
     // Room made, nothing more evictable (as before), or progress: the write's
     // retry loop tries again, each pass bounded, so a busy tenant's writes
     // keep up with 16 threads' worth of eviction rather than one trim's.
+    // Queued offloads are progress too: with offload_on_evict, a pass over
+    // memory-only objects queues them and frees nothing yet. Taking that for
+    // an exhausted tenant refused a spilling tenant's writes 1.7M times in
+    // the eu-west1 A/B, and stopped the passes that fill the offload queue.
     if (result.freed_bytes >= deficit_bytes || !result.budget_exhausted ||
-        result.freed_bytes > 0) {
+        result.freed_bytes > 0 || result.offloads_queued > 0) {
         return true;
     }
     exhausted_tenant = tenant_id;
@@ -10352,6 +10356,7 @@ MasterService::EvictTenantMemoryForQuota(
             << " object(s); force-evicted without disk offload "
                "(offload_force_evict=true).";
     }
+    total.offloads_queued = static_cast<uint64_t>(offload_deferred_count);
     return total;
 }
 
