@@ -10246,6 +10246,16 @@ MasterService::EvictTenantMemoryForQuota(
              scanned < kNumShards && total.freed_bytes < target_bytes &&
              !total.budget_exhausted;
              ++scanned) {
+          // The deadline per shard too, not only per 32 keys examined: a
+          // pass through shards where the tenant has nothing reads no key.
+          // Behind another shard walk (the trim, BatchEvict) such a pass
+          // waited out each of its sections in turn; on eu-west1 sixteen
+          // RPC threads trailed one trim for 12 s and their clients expired.
+          if (deadline != std::chrono::steady_clock::time_point::max() &&
+              std::chrono::steady_clock::now() >= deadline) {
+            total.budget_exhausted = true;
+            break;
+          }
             const size_t shard_idx = (start_shard + scanned) % kNumShards;
             auto snapshot = whole_call ? std::shared_lock<std::shared_mutex>()
                                        : LockSnapshotForSection();

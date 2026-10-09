@@ -312,6 +312,11 @@ class MasterLivenessIsolationTest : public ::testing::Test {
         return std::make_unique<MasterService::MetadataShardAccessorRW>(
             &service, ShardOf(service, key));
     }
+    static auto LockShardAt(MasterService &service, size_t shard) {
+        return std::make_unique<MasterService::MetadataShardAccessorRW>(
+            &service, shard);
+    }
+    static constexpr size_t kShards = MasterService::kNumShards;
 
     static void ReclaimNow(MasterService& service) {
         service.ClearInvalidHandles();
@@ -1130,6 +1135,47 @@ TEST_F(MasterLivenessIsolationTest, QueuedOffloadsAreProgress) {
     // The next write, on the same thread and at once, queues more.
     EXPECT_FALSE(PutIn(*service, a, "spill", "spill_new_1", 4 * kKiB));
     EXPECT_GT(queued(), 0u);
+}
+
+// A write's inline eviction keeps to its deadline when the tenant has few
+// keys and another walk crosses the shards (the trim or BatchEvict hold each
+// for a section). Checked only per 32 keys examined, a pass that examined
+// almost nothing trailed that walk shard by shard: on eu-west1, after three
+// Stores crashed, sixteen RPC threads trailed one trim for 12 s and 48
+// clients' Pings went unanswered until they expired.
+TEST_F(MasterLivenessIsolationTest, InlineEvictionDoesNotTrailAShardWalk) {
+    constexpr uint64_t kKiB = 1 << 10;
+    auto service = MakeQuotaService("trail", 10 * 64 * kKiB,
+                                    /*lease_ms=*/600000);
+    auto a = MountMemoryClient(*service, "trail_a", 0x100000000, 1ULL << 30);
+    for (int i = 0; i < 10; ++i) {
+        const std::string key = "trail_" + std::to_string(i);
+        ASSERT_TRUE(PutIn(*service, a, "trail", key, 64 * kKiB));
+        // Read: a lease, so nothing is evictable.
+        ASSERT_TRUE(service->ExistKey(key, TenantId("trail")));
+    }
+    StopQuotaTrimWorker(*service);
+
+    std::atomic<bool> stop{false};
+    std::thread walker([&] { // A shard walk: each shard for 1 ms, again.
+      while (!stop) {
+        for (size_t i = 0; i < kShards && !stop; ++i) {
+          auto shard = LockShardAt(*service, i);
+          std::this_thread::sleep_for(milliseconds(1));
+        }
+      }
+    });
+    const auto took = Time([&] {
+      for (int i = 0; i < 10; ++i) {
+        EXPECT_FALSE(PutIn(*service, a, "trail",
+                           "trail_new_" + std::to_string(i), 64 * kKiB));
+      }
+    });
+    stop = true;
+    walker.join();
+    LOG(INFO) << "10 refused writes took " << took.count() << " ms";
+    // Each write's passes stop at their deadline (20 ms, plus a section).
+    EXPECT_LT(took.count(), 2000);
 }
 
 // The steady state is unchanged: a tenant at its quota makes room for one
