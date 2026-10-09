@@ -339,7 +339,8 @@ class WrappedMasterService {
     // on its connection's IO thread, which also carries other clients'
     // Pings, and one batch can be a whole disk watermark eviction (497k keys,
     // 10 s on eu-west1). Each runs the method above on a serial worker chosen
-    // by client, so a Store's batches keep their order. RegisterRpcService
+    // by connection, so a connection's calls keep their order and different
+    // connections run in parallel, as on the IO threads. RegisterRpcService
     // registers them under those methods' route keys: the wire is unchanged.
     void BatchEvictDiskReplicaOffIoThread(
         coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
@@ -355,8 +356,8 @@ class WrappedMasterService {
 
    private:
     friend class test::MasterLivenessIsolationTest;
-    static constexpr size_t kStoreBatchWorkers = 4;
-    ThreadPool& StoreBatchWorker(const UUID& client_id);
+    static constexpr size_t kStoreBatchWorkers = 16;  // As RPC threads.
+    ThreadPool& StoreBatchWorker(uint64_t connection_id);
 
     MasterService master_service_;
     // Declared after master_service_, so they finish (and stop) first.

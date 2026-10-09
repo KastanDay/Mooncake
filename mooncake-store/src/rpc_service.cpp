@@ -1628,9 +1628,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
                                              ssd_total_capacity_bytes);
 }
 
-ThreadPool& WrappedMasterService::StoreBatchWorker(const UUID& client_id) {
-    return *store_batch_workers_[boost::hash<UUID>{}(client_id) %
-                                 store_batch_workers_.size()];
+ThreadPool& WrappedMasterService::StoreBatchWorker(uint64_t connection_id) {
+    return *store_batch_workers_[connection_id % store_batch_workers_.size()];
 }
 
 void WrappedMasterService::BatchEvictDiskReplicaOffIoThread(
@@ -1642,15 +1641,17 @@ void WrappedMasterService::BatchEvictDiskReplicaOffIoThread(
         std::vector<std::string> keys;
         std::string tenant_id;
     };
+    const uint64_t connection = ctx.get_context_info()->get_connection_id();
     // Shared: ThreadPool's tasks are std::function, so copyable.
     auto request = std::make_shared<Request>(
         Request{std::move(ctx), std::move(keys), std::move(tenant_id)});
     try {
-        StoreBatchWorker(client_id).enqueue([this, request, client_id,
-                                             replica_type] {
-            request->ctx.response_msg(BatchEvictDiskReplica(
-                client_id, request->keys, request->tenant_id, replica_type));
-        });
+        StoreBatchWorker(connection)
+            .enqueue([this, request, client_id, replica_type] {
+                request->ctx.response_msg(
+                    BatchEvictDiskReplica(client_id, request->keys,
+                                          request->tenant_id, replica_type));
+            });
     } catch (const std::exception&) {  // Stopping.
         request->ctx.response_msg(std::vector<tl::expected<void, ErrorCode>>(
             request->keys.size(),
@@ -1667,10 +1668,11 @@ void WrappedMasterService::NotifyOffloadSuccessOffIoThread(
         std::vector<OffloadTaskItem> tasks;
         std::vector<StorageObjectMetadata> metadatas;
     };
+    const uint64_t connection = ctx.get_context_info()->get_connection_id();
     auto request = std::make_shared<Request>(
         Request{std::move(ctx), std::move(tasks), std::move(metadatas)});
     try {
-        StoreBatchWorker(client_id).enqueue([this, request, client_id] {
+        StoreBatchWorker(connection).enqueue([this, request, client_id] {
             request->ctx.response_msg(NotifyOffloadSuccess(
                 client_id, request->tasks, request->metadatas));
         });
