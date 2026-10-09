@@ -6,6 +6,8 @@
 #include <type_traits>
 
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/struct_pack/md5_constexpr.hpp>
+#include <ylt/util/function_name.h>
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
@@ -88,6 +90,9 @@ WrappedMasterService::WrappedMasterService(
         master_service_.setHttpMetadataServer(http_metadata_server);
     } else if (!http_metadata_remote_url.empty()) {
         master_service_.setHttpMetadataRemoteUrl(http_metadata_remote_url);
+    }
+    for (size_t i = 0; i < kStoreBatchWorkers; ++i) {
+        store_batch_workers_.push_back(std::make_unique<ThreadPool>(1));
     }
 }
 
@@ -1623,6 +1628,58 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
                                              ssd_total_capacity_bytes);
 }
 
+ThreadPool& WrappedMasterService::StoreBatchWorker(const UUID& client_id) {
+    return *store_batch_workers_[boost::hash<UUID>{}(client_id) %
+                                 store_batch_workers_.size()];
+}
+
+void WrappedMasterService::BatchEvictDiskReplicaOffIoThread(
+    coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
+    UUID client_id, std::vector<std::string> keys, std::string tenant_id,
+    ReplicaType replica_type) {
+    struct Request {
+        coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx;
+        std::vector<std::string> keys;
+        std::string tenant_id;
+    };
+    // Shared: ThreadPool's tasks are std::function, so copyable.
+    auto request = std::make_shared<Request>(
+        Request{std::move(ctx), std::move(keys), std::move(tenant_id)});
+    try {
+        StoreBatchWorker(client_id).enqueue([this, request, client_id,
+                                             replica_type] {
+            request->ctx.response_msg(BatchEvictDiskReplica(
+                client_id, request->keys, request->tenant_id, replica_type));
+        });
+    } catch (const std::exception&) {  // Stopping.
+        request->ctx.response_msg(std::vector<tl::expected<void, ErrorCode>>(
+            request->keys.size(),
+            tl::make_unexpected(ErrorCode::INTERNAL_ERROR)));
+    }
+}
+
+void WrappedMasterService::NotifyOffloadSuccessOffIoThread(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx, UUID client_id,
+    std::vector<OffloadTaskItem> tasks,
+    std::vector<StorageObjectMetadata> metadatas) {
+    struct Request {
+        coro_rpc::context<tl::expected<void, ErrorCode>> ctx;
+        std::vector<OffloadTaskItem> tasks;
+        std::vector<StorageObjectMetadata> metadatas;
+    };
+    auto request = std::make_shared<Request>(
+        Request{std::move(ctx), std::move(tasks), std::move(metadatas)});
+    try {
+        StoreBatchWorker(client_id).enqueue([this, request, client_id] {
+            request->ctx.response_msg(NotifyOffloadSuccess(
+                client_id, request->tasks, request->metadatas));
+        });
+    } catch (const std::exception&) {  // Stopping.
+        request->ctx.response_msg(tl::expected<void, ErrorCode>(
+            tl::make_unexpected(ErrorCode::INTERNAL_ERROR)));
+    }
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
@@ -1744,6 +1801,16 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
         objects, initial_oplog_sequence_id, segments);
 }
 
+namespace {
+// The route key coro_rpc derives from a function's name (its default
+// protocol has no gen_register_key).
+template <auto func>
+constexpr uint32_t RouteKeyOf() {
+    constexpr auto name = coro_rpc::get_func_name<func>();
+    return struct_pack::MD5::MD5Hash32Constexpr(name.data(), name.length());
+}
+}  // namespace
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
@@ -1840,9 +1907,11 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReportSsdCapacity>(
         &wrapped_master_service);
+    // Off the IO threads, under the synchronous method's route key.
     server.register_handler<
-        &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
-        &wrapped_master_service);
+        &mooncake::WrappedMasterService::NotifyOffloadSuccessOffIoThread>(
+        &wrapped_master_service,
+        RouteKeyOf<&mooncake::WrappedMasterService::NotifyOffloadSuccess>());
     server.register_handler<
         &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(
         &wrapped_master_service);
@@ -1879,8 +1948,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::EvictDiskReplica>(
         &wrapped_master_service);
     server.register_handler<
-        &mooncake::WrappedMasterService::BatchEvictDiskReplica>(
-        &wrapped_master_service);
+        &mooncake::WrappedMasterService::BatchEvictDiskReplicaOffIoThread>(
+        &wrapped_master_service,
+        RouteKeyOf<&mooncake::WrappedMasterService::BatchEvictDiskReplica>());
     server.register_handler<&mooncake::WrappedMasterService::PollRemoveAll>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(

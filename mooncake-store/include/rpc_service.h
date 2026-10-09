@@ -14,8 +14,13 @@
 #include "master_config.h"
 #include "kv_event/kv_event_publisher.h"
 #include "segment.h"
+#include "thread_pool.h"
 
 namespace mooncake {
+
+namespace test {
+class MasterLivenessIsolationTest;
+}
 
 // Forward declaration
 class HttpMetadataServer;
@@ -330,11 +335,32 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
 
+    // The Stores' batch RPCs, served off the RPC IO threads: a handler runs
+    // on its connection's IO thread, which also carries other clients'
+    // Pings, and one batch can be a whole disk watermark eviction (497k keys,
+    // 10 s on eu-west1). Each runs the method above on a serial worker chosen
+    // by client, so a Store's batches keep their order. RegisterRpcService
+    // registers them under those methods' route keys: the wire is unchanged.
+    void BatchEvictDiskReplicaOffIoThread(
+        coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
+        UUID client_id, std::vector<std::string> keys, std::string tenant_id,
+        ReplicaType replica_type);
+    void NotifyOffloadSuccessOffIoThread(
+        coro_rpc::context<tl::expected<void, ErrorCode>> ctx, UUID client_id,
+        std::vector<OffloadTaskItem> tasks,
+        std::vector<StorageObjectMetadata> metadatas);
+
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    friend class test::MasterLivenessIsolationTest;
+    static constexpr size_t kStoreBatchWorkers = 4;
+    ThreadPool& StoreBatchWorker(const UUID& client_id);
+
     MasterService master_service_;
+    // Declared after master_service_, so they finish (and stop) first.
+    std::vector<std::unique_ptr<ThreadPool>> store_batch_workers_;
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,

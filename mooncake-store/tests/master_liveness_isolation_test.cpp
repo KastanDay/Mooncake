@@ -27,9 +27,15 @@
 #include <unistd.h>
 #include <vector>
 
+#include <async_simple/coro/SyncAwait.h>
+#include <ylt/coro_rpc/coro_rpc_client.hpp>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
+
 #include "master_service.h"
+#include "rpc_service.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
+#include "utils.h"
 
 namespace mooncake::test {
 
@@ -317,6 +323,13 @@ class MasterLivenessIsolationTest : public ::testing::Test {
             &service, shard);
     }
     static constexpr size_t kShards = MasterService::kNumShards;
+    static bool MakeRoomForWrite(MasterService& service,
+                                 const std::string& tenant, uint64_t bytes) {
+        return service.MakeRoomForWrite(TenantId(tenant), bytes);
+    }
+    static MasterService& ServiceOf(WrappedMasterService& wrapped) {
+        return wrapped.master_service_;
+    }
 
     static void ReclaimNow(MasterService& service) {
         service.ClearInvalidHandles();
@@ -1128,12 +1141,13 @@ TEST_F(MasterLivenessIsolationTest, QueuedOffloadsAreProgress) {
     };
     ASSERT_EQ(queued(), 0u);  // At its quota: nothing evicted yet.
 
-    // Over by one object, and every candidate is memory-only: the passes
-    // queue offloads and free nothing, so the write is refused.
-    EXPECT_FALSE(PutIn(*service, a, "spill", "spill_new_0", 4 * kKiB));
+    // A write over by one object, and every candidate memory-only: the pass
+    // queues offloads and frees nothing. That is progress: the write may
+    // retry, and this thread is not left refusing the tenant unscanned.
+    EXPECT_TRUE(MakeRoomForWrite(*service, "spill", 4 * kKiB));
     EXPECT_GT(queued(), 0u);
-    // The next write, on the same thread and at once, queues more.
-    EXPECT_FALSE(PutIn(*service, a, "spill", "spill_new_1", 4 * kKiB));
+    // So the tenant's next write still scans, and queues more.
+    EXPECT_FALSE(PutIn(*service, a, "spill", "spill_new", 4 * kKiB));
     EXPECT_GT(queued(), 0u);
 }
 
@@ -1176,6 +1190,77 @@ TEST_F(MasterLivenessIsolationTest, InlineEvictionDoesNotTrailAShardWalk) {
     LOG(INFO) << "10 refused writes took " << took.count() << " ms";
     // Each write's passes stop at their deadline (20 ms, plus a section).
     EXPECT_LT(took.count(), 2000);
+}
+
+// A Store's batch RPC runs off the RPC IO thread, so a Ping on the same
+// thread is answered while the batch works. On eu-west1 one disk watermark
+// eviction was a 497k-key BatchEvictDiskReplica that held its IO thread for
+// 10 s, and two clients whose Pings queued behind it expired. Here the batch
+// is held on a shard lock, and the server has one IO thread for both
+// clients. The calls name the synchronous methods, as old clients do.
+TEST_F(MasterLivenessIsolationTest, StoreBatchRpcsLeaveTheIoThreadFree) {
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    WrappedMasterService wrapped(config);
+    const int port = getFreeTcpPort();
+    coro_rpc::coro_rpc_server server(/*thread_num=*/1, port, "127.0.0.1",
+                                     std::chrono::seconds(0),
+                                     /*tcp_no_delay=*/true);
+    RegisterRpcService(server, wrapped);
+    ASSERT_FALSE(server.async_start().hasResult());
+    std::this_thread::sleep_for(milliseconds(200));  // Bound.
+    auto connect = [&] {
+        auto client = std::make_unique<coro_rpc::coro_rpc_client>();
+        EXPECT_FALSE(async_simple::coro::syncAwait(
+            client->connect("127.0.0.1", std::to_string(port))));
+        return client;
+    };
+    auto store = connect();
+    auto other = connect();
+    const UUID store_id = generate_uuid();
+    const UUID other_id = generate_uuid();
+
+    for (const bool evict : {true, false}) {
+        auto shard = LockShard(ServiceOf(wrapped), "held_key");
+        auto batch = std::async(std::launch::async, [&] {
+            if (evict) {
+                return async_simple::coro::syncAwait(
+                           store->call<
+                               &WrappedMasterService::BatchEvictDiskReplica>(
+                               store_id, std::vector<std::string>{"held_key"},
+                               std::string(TenantId::kDefaultValue),
+                               ReplicaType::LOCAL_DISK))
+                    .has_value();
+            }
+            OffloadTaskItem task{};
+            task.tenant_id = std::string(TenantId::kDefaultValue);
+            task.key = "held_key";
+            StorageObjectMetadata nack{};
+            nack.data_size = -1;  // A failed offload: cleanup only.
+            return async_simple::coro::syncAwait(
+                       store->call<&WrappedMasterService::NotifyOffloadSuccess>(
+                           store_id, std::vector<OffloadTaskItem>{task},
+                           std::vector<StorageObjectMetadata>{nack}))
+                .has_value();
+        });
+        std::this_thread::sleep_for(milliseconds(200));  // Batch is held.
+        ASSERT_EQ(batch.wait_for(milliseconds(0)), std::future_status::timeout);
+
+        auto ping = std::async(std::launch::async, [&] {
+            return async_simple::coro::syncAwait(
+                       other->call<&WrappedMasterService::Ping>(other_id))
+                .has_value();
+        });
+        const bool answered =
+            ping.wait_for(milliseconds(1000)) == std::future_status::ready;
+        shard.reset();
+        EXPECT_TRUE(answered)
+            << (evict ? "BatchEvictDiskReplica" : "NotifyOffloadSuccess")
+            << " held the IO thread";
+        EXPECT_TRUE(ping.get());
+        EXPECT_TRUE(batch.get());  // Served once released.
+    }
+    server.stop();
 }
 
 // The steady state is unchanged: a tenant at its quota makes room for one
