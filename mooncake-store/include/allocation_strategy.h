@@ -159,6 +159,45 @@ class AllocatorManager {
  * it will allocate as many replicas as possible rather than failing entirely.
  * Only returns an error if no replicas can be allocated at all.
  */
+/**
+ * @brief Allocates next to an anchor: from the anchor allocator (one mounted
+ * segment) if it is still allocatable, else from the first other allocator
+ * of the same segment name, in mount order after the anchor.
+ *
+ * Membership in `allocator_manager` is what makes an allocator allocatable:
+ * unmount, graceful unmount and drain all remove it. The caller must hold the
+ * ScopedAllocatorAccess the manager came from. An anchor that is no longer a
+ * member is never allocated from.
+ * @return the buffer, or nullptr when no allocator of the segment has room.
+ */
+inline std::unique_ptr<AllocatedBuffer> AllocateNearAnchor(
+    const AllocatorManager& allocator_manager,
+    const std::weak_ptr<BufferAllocatorBase>& anchor,
+    const std::string& anchor_segment, size_t slice_length) {
+    const auto* allocators = allocator_manager.getAllocators(anchor_segment);
+    if (allocators == nullptr || allocators->empty() || slice_length == 0) {
+        return nullptr;
+    }
+    size_t start = 0;
+    if (const auto locked = anchor.lock()) {
+        const auto it =
+            std::find(allocators->begin(), allocators->end(), locked);
+        if (it != allocators->end()) {
+            start = static_cast<size_t>(it - allocators->begin());
+        }
+    }
+    for (size_t i = 0; i < allocators->size(); ++i) {
+        const auto& allocator = (*allocators)[(start + i) % allocators->size()];
+        if (!allocator) {
+            continue;
+        }
+        if (auto buffer = allocator->allocate(slice_length)) {
+            return buffer;
+        }
+    }
+    return nullptr;
+}
+
 class AllocationStrategy {
    public:
     virtual ~AllocationStrategy() = default;

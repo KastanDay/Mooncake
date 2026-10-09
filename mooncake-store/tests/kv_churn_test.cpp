@@ -1,5 +1,11 @@
-// Churn measurement (--enable_kv_churn_metrics): phase P0 of
+// Churn measurement (--enable_kv_churn_metrics) and batch co-location
+// (--colocate_batch_puts): phases P0 and A of
 // docs/source/design/store/hot-replica-churn.md.
+//
+// An elastic Store mounts every 64 GiB chunk of its memory under one segment
+// name, and elastic shrink frees one chunk at a time. Placing a batch on one
+// Store is therefore not enough: it must land in one chunk, or a single
+// shrink breaks nearly every prefix written to that Store.
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -13,6 +19,7 @@
 
 #include "kv_churn.h"
 #include "master_service.h"
+#include "rpc_service.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -30,13 +37,14 @@ class KvChurnTest : public ::testing::Test {
     }
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
-    static MasterServiceConfig Config(bool metrics) {
+    static MasterServiceConfig Config(bool colocate, bool metrics) {
         MasterServiceConfig config;
         config.default_kv_lease_ttl = 0;
         config.client_live_ttl_sec = 3600;
         config.allocation_strategy_type =
             AllocationStrategyType::FREE_RATIO_FIRST;
         config.kv_churn.enable_metrics = metrics;
+        config.kv_churn.colocate_batch_puts = colocate;
         return config;
     }
 
@@ -150,6 +158,210 @@ class KvChurnTest : public ::testing::Test {
 };
 
 // ---------------------------------------------------------------------------
+// Change A: co-locate a batch put's objects in one chunk.
+
+// Two Stores of five chunks each. A BatchPutStart of 40 objects lands in a
+// single chunk; without co-location it spreads over most of a Store's chunks.
+TEST_F(KvChurnTest, BatchPutLandsInOneChunk) {
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    config.allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+    config.kv_churn.colocate_batch_puts = true;
+    config.kv_churn.enable_metrics = true;
+    WrappedMasterService service(config);
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    auto chunks =
+        MountStore(service, client_a, "store-a", 0x100000000, 5, 64 * kMiB);
+    auto store_b =
+        MountStore(service, client_b, "store-b", 0x200000000, 5, 64 * kMiB);
+    chunks.insert(chunks.end(), store_b.begin(), store_b.end());
+
+    std::vector<std::string> keys;
+    for (int i = 0; i < 40; ++i) keys.push_back("batch-" + std::to_string(i));
+    const std::vector<uint64_t> sizes(keys.size(), 256 * 1024);
+    const double spans_before = Metric("master_kv_batch_segments_spanned_sum",
+                                       {"op=\"put\"", "level=\"chunk\""});
+
+    auto results = service.BatchPutStart(client_a, keys, sizes, {});
+    std::set<int> used;
+    for (const auto& result : results) {
+        ASSERT_TRUE(result.has_value());
+        used.insert(ChunkOf(chunks, result.value()));
+    }
+    EXPECT_EQ(used.size(), 1u);
+    EXPECT_NE(*used.begin(), -1);
+    EXPECT_EQ(Metric("master_kv_batch_segments_spanned_sum",
+                     {"op=\"put\"", "level=\"chunk\""}) -
+                  spans_before,
+              1);
+}
+
+// With the flag off, a batch is placed object by object as before.
+TEST_F(KvChurnTest, FlagOffKeepsPerObjectPlacement) {
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    config.allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+    config.kv_churn.enable_metrics = true;
+    WrappedMasterService service(config);
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    auto chunks =
+        MountStore(service, client_a, "store-a", 0x100000000, 5, 64 * kMiB);
+    auto store_b =
+        MountStore(service, client_b, "store-b", 0x200000000, 5, 64 * kMiB);
+    chunks.insert(chunks.end(), store_b.begin(), store_b.end());
+
+    std::vector<std::string> keys;
+    for (int i = 0; i < 40; ++i) keys.push_back("spread-" + std::to_string(i));
+    const std::vector<uint64_t> sizes(keys.size(), 256 * 1024);
+    const double spans_before = Metric("master_kv_batch_segments_spanned_sum",
+                                       {"op=\"put\"", "level=\"chunk\""});
+
+    auto results = service.BatchPutStart(client_a, keys, sizes, {});
+    std::set<int> used;
+    for (const auto& result : results) {
+        ASSERT_TRUE(result.has_value());
+        used.insert(ChunkOf(chunks, result.value()));
+    }
+    // 40 objects drawn over ten chunks: one chunk by chance is ~10^-27.
+    EXPECT_GT(used.size(), 1u);
+    EXPECT_EQ(Metric("master_kv_batch_segments_spanned_sum",
+                     {"op=\"put\"", "level=\"chunk\""}) -
+                  spans_before,
+              static_cast<double>(used.size()));
+}
+
+// The anchor chunk fills mid-batch: the batch moves to one sibling chunk of
+// the same Store, and only when the whole Store is full to the ranked
+// placement (the other Store).
+TEST_F(KvChurnTest, FullAnchorSpillsToSiblingThenRanked) {
+    MasterService service(Config(/*colocate=*/true, /*metrics=*/false));
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    // Store B exists first and is half full, so the batch's first object
+    // goes to the emptier Store A.
+    auto chunks =
+        MountStore(service, client_b, "store-b", 0x200000000, 1, 16 * kMiB);
+    PutAndEnd(service, client_b, "filler", 8 * kMiB);
+    auto store_a =
+        MountStore(service, client_a, "store-a", 0x100000000, 2, 1 * kMiB);
+    chunks.insert(chunks.end(), store_a.begin(), store_a.end());
+    constexpr int kStoreB = 0;
+
+    auto placement = service.BeginBatchPlacement();
+    ASSERT_TRUE(placement.has_value());
+    std::vector<int> sequence;
+    for (int i = 0; i < 30; ++i) {
+        auto result = Put(service, client_a, "spill-" + std::to_string(i),
+                          128 * 1024, &*placement);
+        ASSERT_TRUE(result.has_value()) << i;
+        sequence.push_back(ChunkOf(chunks, result.value()));
+    }
+
+    // Runs: anchor chunk, then the sibling, then Store B; no chunk twice.
+    std::vector<int> runs;
+    for (int chunk : sequence) {
+        if (runs.empty() || runs.back() != chunk) runs.push_back(chunk);
+    }
+    ASSERT_EQ(runs.size(), 3u) << ::testing::PrintToString(sequence);
+    EXPECT_NE(runs[0], kStoreB);
+    EXPECT_NE(runs[1], kStoreB);
+    EXPECT_NE(runs[0], runs[1]);
+    EXPECT_EQ(runs[2], kStoreB);
+}
+
+// The anchor chunk is unmounted between two keys of a batch: later objects
+// never go to it, and stay together in one sibling chunk.
+TEST_F(KvChurnTest, UnmountedAnchorIsSkipped) {
+    MasterService service(Config(/*colocate=*/true, /*metrics=*/false));
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    auto chunks =
+        MountStore(service, client_b, "store-b", 0x200000000, 1, 64 * kMiB);
+    PutAndEnd(service, client_b, "filler", 32 * kMiB);
+    auto store_a =
+        MountStore(service, client_a, "store-a", 0x100000000, 3, 64 * kMiB);
+    chunks.insert(chunks.end(), store_a.begin(), store_a.end());
+
+    auto placement = service.BeginBatchPlacement();
+    auto first = Put(service, client_a, "unmount-0", 256 * 1024, &*placement);
+    ASSERT_TRUE(first.has_value());
+    const int anchor = ChunkOf(chunks, first.value());
+    ASSERT_GE(anchor, 1);  // in Store A
+    ASSERT_TRUE(
+        service.UnmountSegment(chunks[anchor].id, client_a).has_value());
+
+    std::set<int> used;
+    for (int i = 1; i <= 10; ++i) {
+        auto result = Put(service, client_a, "unmount-" + std::to_string(i),
+                          256 * 1024, &*placement);
+        ASSERT_TRUE(result.has_value());
+        used.insert(ChunkOf(chunks, result.value()));
+    }
+    EXPECT_FALSE(used.contains(anchor));
+    ASSERT_EQ(used.size(), 1u);
+    EXPECT_GE(*used.begin(), 1);  // a sibling in Store A
+}
+
+// The same with a graceful unmount, which keeps the chunk's allocator alive
+// (a dead weak_ptr is not the signal) but no longer allocatable.
+TEST_F(KvChurnTest, GracefullyUnmountingAnchorIsSkipped) {
+    MasterService service(Config(/*colocate=*/true, /*metrics=*/false));
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    auto chunks =
+        MountStore(service, client_b, "store-b", 0x200000000, 1, 64 * kMiB);
+    PutAndEnd(service, client_b, "filler", 32 * kMiB);
+    auto store_a =
+        MountStore(service, client_a, "store-a", 0x100000000, 3, 64 * kMiB);
+    chunks.insert(chunks.end(), store_a.begin(), store_a.end());
+
+    auto placement = service.BeginBatchPlacement();
+    auto first = Put(service, client_a, "graceful-0", 256 * 1024, &*placement);
+    ASSERT_TRUE(first.has_value());
+    const int anchor = ChunkOf(chunks, first.value());
+    ASSERT_GE(anchor, 1);
+    ASSERT_TRUE(service
+                    .GracefulUnmountSegment(chunks[anchor].id, client_a,
+                                            /*grace_period_ms=*/3600 * 1000)
+                    .has_value());
+    ASSERT_FALSE(placement->anchor.expired());
+
+    std::set<int> used;
+    for (int i = 1; i <= 10; ++i) {
+        auto result = Put(service, client_a, "graceful-" + std::to_string(i),
+                          256 * 1024, &*placement);
+        ASSERT_TRUE(result.has_value());
+        used.insert(ChunkOf(chunks, result.value()));
+    }
+    EXPECT_FALSE(used.contains(anchor));
+    ASSERT_EQ(used.size(), 1u);
+    EXPECT_GE(*used.begin(), 1);
+}
+
+// A client's explicit preferred segment wins over the anchor.
+TEST_F(KvChurnTest, ClientPreferenceOverridesAnchor) {
+    MasterService service(Config(/*colocate=*/true, /*metrics=*/false));
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    auto chunks =
+        MountStore(service, client_a, "store-a", 0x100000000, 1, 64 * kMiB);
+    auto store_b =
+        MountStore(service, client_b, "store-b", 0x200000000, 1, 64 * kMiB);
+    chunks.insert(chunks.end(), store_b.begin(), store_b.end());
+
+    auto placement = service.BeginBatchPlacement();
+    auto first = Put(service, client_a, "pref-0", 1024, &*placement, "store-a");
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(ChunkOf(chunks, first.value()), 0);
+    auto second =
+        Put(service, client_a, "pref-1", 1024, &*placement, "store-b");
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(ChunkOf(chunks, second.value()), 1);
+}
+
+// ---------------------------------------------------------------------------
 // P0: measurement.
 
 TEST_F(KvChurnTest, HeatDecaysByHalfLifeAndSaturates) {
@@ -206,7 +418,7 @@ TEST_F(KvChurnTest, MissFilterRemembersForOneWindow) {
 // miss, the cleanup pass records the drop with the heat it had, and a miss
 // after it is found in the filter.
 TEST_F(KvChurnTest, UnmountedObjectMissesAreChurnMisses) {
-    MasterService service(Config(/*metrics=*/true));
+    MasterService service(Config(/*colocate=*/false, /*metrics=*/true));
     StopCleanupWorker(service);
     const UUID client = generate_uuid();
     auto chunks =
@@ -273,7 +485,7 @@ TEST_F(KvChurnTest, UnmountedObjectMissesAreChurnMisses) {
 // prefix-ordered batch exist reports the first miss's cause and the keys
 // stranded behind it.
 TEST_F(KvChurnTest, BatchExistAttributesFirstMissAndStrandedKeys) {
-    MasterService service(Config(/*metrics=*/true));
+    MasterService service(Config(/*colocate=*/false, /*metrics=*/true));
     StopCleanupWorker(service);
     const UUID survivor = generate_uuid();
     const UUID doomed = generate_uuid();
@@ -324,7 +536,7 @@ TEST_F(KvChurnTest, BatchExistAttributesFirstMissAndStrandedKeys) {
 
 // Eviction that leaves no servable copy is remembered as evict_memory.
 TEST_F(KvChurnTest, EvictionWithoutCopyIsRemembered) {
-    MasterService service(Config(/*metrics=*/true));
+    MasterService service(Config(/*colocate=*/false, /*metrics=*/true));
     const double misses = Metric("master_kv_churn_misses_total",
                                  {"api=\"get\"", "cause=\"evict_memory\""});
     EvictWithoutCopy(service, "evicted", 4096);
@@ -336,35 +548,39 @@ TEST_F(KvChurnTest, EvictionWithoutCopyIsRemembered) {
               1);
 }
 
-// The read-side span counts chunks, not just segment names: a batch
-// scattered over one Store's chunks spans one Store but several chunks.
+// The read-side span counts chunks, not segment names: a co-located batch
+// is read from one chunk, a scattered one from several chunks of one Store.
 TEST_F(KvChurnTest, BatchGetSpanCountsChunks) {
-    MasterService service(Config(/*metrics=*/true));
-    const UUID client = generate_uuid();
-    MountStore(service, client, "store-g", 0x100000000, 5, 64 * kMiB);
-    auto placement = service.BeginBatchPlacement();
-    ASSERT_TRUE(placement.has_value());
-    std::vector<std::string> keys;
-    for (int i = 0; i < 30; ++i) {
-        keys.push_back("g-" + std::to_string(i));
-        PutAndEnd(service, client, keys.back(), 256 * 1024, &*placement);
+    for (const bool colocate : {true, false}) {
+        MasterService service(Config(colocate, /*metrics=*/true));
+        const UUID client = generate_uuid();
+        MountStore(service, client, "store-g", 0x100000000, 5, 64 * kMiB);
+        auto placement = service.BeginBatchPlacement();
+        std::vector<std::string> keys;
+        for (int i = 0; i < 30; ++i) {
+            keys.push_back("g-" + std::to_string(i));
+            PutAndEnd(service, client, keys.back(), 256 * 1024, &*placement);
+        }
+        const std::vector<std::string> chunk{"op=\"get\"", "level=\"chunk\""};
+        const std::vector<std::string> store{"op=\"get\"", "level=\"store\""};
+        const double chunks_before =
+            Metric("master_kv_batch_segments_spanned_sum", chunk);
+        const double stores_before =
+            Metric("master_kv_batch_segments_spanned_sum", store);
+        auto results = service.BatchGetReplicaList(keys, TenantId::Default());
+        for (const auto& result : results) ASSERT_TRUE(result.has_value());
+        const double chunks =
+            Metric("master_kv_batch_segments_spanned_sum", chunk) -
+            chunks_before;
+        EXPECT_EQ(Metric("master_kv_batch_segments_spanned_sum", store) -
+                      stores_before,
+                  1);
+        if (colocate) {
+            EXPECT_EQ(chunks, 1) << "colocate";
+        } else {
+            EXPECT_GT(chunks, 1) << "scattered";
+        }
     }
-    EXPECT_GT(placement->chunks.size(), 1u);
-    EXPECT_EQ(placement->stores.size(), 1u);
-    const std::vector<std::string> chunk{"op=\"get\"", "level=\"chunk\""};
-    const std::vector<std::string> store{"op=\"get\"", "level=\"store\""};
-    const double chunks_before =
-        Metric("master_kv_batch_segments_spanned_sum", chunk);
-    const double stores_before =
-        Metric("master_kv_batch_segments_spanned_sum", store);
-    auto results = service.BatchGetReplicaList(keys, TenantId::Default());
-    for (const auto& result : results) ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(
-        Metric("master_kv_batch_segments_spanned_sum", chunk) - chunks_before,
-        static_cast<double>(placement->chunks.size()));
-    EXPECT_EQ(
-        Metric("master_kv_batch_segments_spanned_sum", store) - stores_before,
-        1);
 }
 
 }  // namespace mooncake::test

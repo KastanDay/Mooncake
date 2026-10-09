@@ -493,7 +493,8 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             }
         }
     } else {
-        // The placement-span metric follows the batch across its keys.
+        // Co-location (--colocate_batch_puts) and the placement-span metric
+        // follow the batch across its keys.
         auto placement = master_service_.BeginBatchPlacement();
         for (size_t i = 0; i < keys.size(); ++i) {
             auto key_config = config.ForSingleKey(i);
