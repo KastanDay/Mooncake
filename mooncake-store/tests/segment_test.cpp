@@ -258,6 +258,89 @@ TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
     EXPECT_EQ(usage.capacity_bytes, 0u);
 }
 
+TEST_F(SegmentTest, MemoryUsageSnapshotReportsAllocatorFootprint) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 64 * 1024 * 1024;
+    // Between two size classes, so the allocator rounds it up.
+    constexpr size_t kObjectSize = 2248704;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "footprint_snapshot_segment";
+    segment.size = kSegmentSize;
+    segment.base = 0x100000000;
+    UUID client_id = generate_uuid();
+
+    std::shared_ptr<BufferAllocatorBase> allocator;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+        allocator = segment_access.GetAllocator(segment.id);
+    }
+    ASSERT_NE(allocator, nullptr);
+    const auto* offset_allocator =
+        dynamic_cast<OffsetBufferAllocator*>(allocator.get());
+    ASSERT_NE(offset_allocator, nullptr);
+    const uint64_t rounded =
+        offset_allocator->getOffsetAllocator()->normalizedAllocationSize(
+            kObjectSize);
+    ASSERT_GT(rounded, kObjectSize);
+
+    auto buffer = allocator->allocate(kObjectSize);
+    ASSERT_NE(buffer, nullptr);
+
+    auto snapshot = segment_manager.GetMemoryUsageSnapshot();
+    EXPECT_EQ(snapshot.used_bytes, kObjectSize);
+    EXPECT_EQ(snapshot.footprint_bytes, rounded);
+    ASSERT_EQ(snapshot.segment_footprints.size(), 1u);
+    const auto& footprint = snapshot.segment_footprints.at(segment.name);
+    EXPECT_EQ(footprint.reserved_bytes, rounded);
+    EXPECT_EQ(footprint.largest_free_region_bytes,
+              allocator->getLargestFreeRegion());
+
+    buffer.reset();
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
+                                                       metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
+                                                      metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
+    allocator.reset();
+    snapshot = segment_manager.GetMemoryUsageSnapshot();
+    EXPECT_EQ(snapshot.footprint_bytes, 0u);
+    EXPECT_TRUE(snapshot.segment_footprints.empty());
+}
+
+TEST_F(SegmentTest, MemoryUsageSnapshotFootprintFallsBackToUsedBytes) {
+    SegmentManager segment_manager(BufferAllocatorType::CACHELIB);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "cachelib_footprint_segment";
+    segment.size = 16 * 1024 * 1024;
+    segment.base = 0x100000000;
+    UUID client_id = generate_uuid();
+
+    std::shared_ptr<BufferAllocatorBase> allocator;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+        allocator = segment_access.GetAllocator(segment.id);
+    }
+    ASSERT_NE(allocator, nullptr);
+    auto buffer = allocator->allocate(4096);
+    ASSERT_NE(buffer, nullptr);
+
+    const auto snapshot = segment_manager.GetMemoryUsageSnapshot();
+    EXPECT_EQ(snapshot.footprint_bytes, snapshot.used_bytes);
+    EXPECT_TRUE(snapshot.segment_footprints.empty());
+}
+
 TEST_F(SegmentTest, AggregateMemoryUsageDoesNotTakeSegmentMutex) {
     SegmentManager segment_manager(BufferAllocatorType::OFFSET);
     auto segment_lock = HoldSegmentMutexForTesting(segment_manager);

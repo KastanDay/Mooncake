@@ -381,6 +381,12 @@ class SegmentSerializer {
 
 struct StorageUsageSnapshot : StorageUsage {
     std::map<std::string, StorageUsage> segments;
+    // used_bytes plus the allocators' rounding padding: what the allocators
+    // have set aside (BufferAllocatorBase::footprint). An allocator without a
+    // footprint contributes its used bytes.
+    size_t footprint_bytes{0};
+    // Only segments whose allocators all report a footprint.
+    std::map<std::string, AllocatorFootprint> segment_footprints;
 };
 
 struct TieredStorageUsageSnapshot {

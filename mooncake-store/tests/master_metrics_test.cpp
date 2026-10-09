@@ -617,6 +617,84 @@ TEST_F(MasterMetricsTest, ProjectStorageUsageRemovesAbsentSegmentLabels) {
     EXPECT_EQ(metrics.get_total_nof_capacity(), 0);
 }
 
+TEST_F(MasterMetricsTest, ProjectStorageUsageExportsAllocatorFootprint) {
+    auto& metrics = MasterMetricManager::instance();
+    const std::string footprint_segment = "projected_footprint_segment";
+
+    TieredStorageUsageSnapshot snapshot;
+    snapshot.memory.used_bytes = 4096;
+    snapshot.memory.capacity_bytes = 65536;
+    snapshot.memory.footprint_bytes = 4608;
+    snapshot.memory.segments[footprint_segment] = {4096, 65536};
+    snapshot.memory.segment_footprints[footprint_segment] = {4608, 32768};
+    metrics.project_storage_usage(snapshot);
+
+    EXPECT_EQ(metrics.get_allocated_mem_footprint(), 4608);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_footprint(footprint_segment),
+              4608);
+    EXPECT_EQ(metrics.get_segment_largest_free_region(footprint_segment),
+              32768);
+    const std::string with_labels = metrics.serialize_metrics();
+    EXPECT_NE(with_labels.find("master_allocated_footprint_bytes 4608"),
+              std::string::npos);
+    EXPECT_NE(with_labels.find("segment_allocated_footprint_bytes{segment=\"" +
+                               footprint_segment + "\"} 4608"),
+              std::string::npos);
+    EXPECT_NE(with_labels.find("segment_largest_free_region_bytes{segment=\"" +
+                               footprint_segment + "\"} 32768"),
+              std::string::npos);
+
+    metrics.project_storage_usage({});
+    const std::string after = metrics.serialize_metrics();
+    EXPECT_EQ(after.find("segment=\"" + footprint_segment + "\""),
+              std::string::npos);
+    EXPECT_EQ(metrics.get_allocated_mem_footprint(), 0);
+}
+
+TEST_F(MasterMetricsTest, StorageSnapshotFootprintCoversPutPadding) {
+    // End to end through the service: a mounted offset-allocator segment and
+    // a Put whose size falls between two allocator size classes.
+    constexpr size_t kSegmentSize = 64 * 1024 * 1024;
+    constexpr uint64_t kValueSize = 2248704;
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_metric_reporting = false;
+    service_config.memory_allocator = BufferAllocatorType::OFFSET;
+    WrappedMasterService service(service_config);
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "footprint_put_segment";
+    segment.base = 0x300000000;
+    segment.size = kSegmentSize;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(service.PutStart(client_id, "footprint_key", kValueSize, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(client_id,
+                            ObjectMeta{"footprint_key", std::nullopt},
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    const auto snapshot = service.GetStorageUsageSnapshot();
+    EXPECT_EQ(snapshot.memory.used_bytes, kValueSize);
+    EXPECT_GT(snapshot.memory.footprint_bytes, kValueSize);
+    ASSERT_TRUE(snapshot.memory.segment_footprints.contains(segment.name));
+    EXPECT_EQ(
+        snapshot.memory.segment_footprints.at(segment.name).reserved_bytes,
+        snapshot.memory.footprint_bytes);
+
+    auto& metrics = MasterMetricManager::instance();
+    metrics.project_storage_usage(snapshot);
+    EXPECT_EQ(metrics.get_allocated_mem_footprint(),
+              static_cast<int64_t>(snapshot.memory.footprint_bytes));
+    metrics.project_storage_usage({});
+}
+
 TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = 100;

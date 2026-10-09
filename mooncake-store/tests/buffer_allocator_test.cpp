@@ -134,6 +134,51 @@ TEST_F(BufferAllocatorTest, OffsetLargestFreeRegionRemainsExact) {
     EXPECT_EQ(allocator->getLargestFreeRegion(), CAPACITY);
 }
 
+TEST_F(BufferAllocatorTest, OffsetFootprintCountsSizeClassPadding) {
+    constexpr size_t kCapacity = 64 * 1024 * 1024;
+    // Between two size classes, so the allocator rounds it up.
+    constexpr size_t kObjectSize = 2248704;
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "footprint-padding", 0x140000000ULL, kCapacity, "footprint-padding");
+    const uint64_t rounded =
+        allocator->getOffsetAllocator()->normalizedAllocationSize(kObjectSize);
+    ASSERT_GT(rounded, kObjectSize);
+
+    auto footprint = allocator->footprint();
+    ASSERT_TRUE(footprint.has_value());
+    EXPECT_EQ(footprint->reserved_bytes, 0u);
+    EXPECT_EQ(footprint->largest_free_region_bytes, kCapacity);
+
+    auto first = allocator->allocate(kObjectSize);
+    auto second = allocator->allocate(kObjectSize);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    footprint = allocator->footprint();
+    ASSERT_TRUE(footprint.has_value());
+    EXPECT_EQ(allocator->size(), 2 * kObjectSize);
+    EXPECT_EQ(footprint->reserved_bytes, 2 * rounded);
+    EXPECT_EQ(footprint->largest_free_region_bytes,
+              allocator->getLargestFreeRegion());
+    EXPECT_LE(footprint->largest_free_region_bytes,
+              kCapacity - footprint->reserved_bytes);
+
+    first.reset();
+    second.reset();
+    footprint = allocator->footprint();
+    ASSERT_TRUE(footprint.has_value());
+    EXPECT_EQ(footprint->reserved_bytes, 0u);
+    EXPECT_EQ(footprint->largest_free_region_bytes, kCapacity);
+}
+
+TEST_F(BufferAllocatorTest, CachelibReportsNoFootprint) {
+    auto allocator =
+        CreateTestAllocator("cachelib-footprint", 0, 16 * 1024 * 1024,
+                            BufferAllocatorType::CACHELIB);
+    auto buffer = allocator->allocate(4096);
+    ASSERT_NE(buffer, nullptr);
+    EXPECT_FALSE(allocator->footprint().has_value());
+}
+
 TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsAtOriginalAddresses) {
     constexpr uintptr_t kBase = 0x180000000ULL;
     constexpr size_t kCapacity = 16 * 1024 * 1024;

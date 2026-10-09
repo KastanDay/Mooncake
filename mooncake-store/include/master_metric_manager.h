@@ -96,6 +96,9 @@ class MasterMetricManager {
     void reset_segment_total_mem_capacity(const std::string& segment);
     int64_t get_segment_allocated_mem_size(const std::string& segment);
     int64_t get_segment_total_mem_capacity(const std::string& segment);
+    int64_t get_allocated_mem_footprint();
+    int64_t get_segment_allocated_mem_footprint(const std::string& segment);
+    int64_t get_segment_largest_free_region(const std::string& segment);
     // Remove all per-segment metric labels for the given segment.
     // Called when a segment is unmounted to prevent stale 0-value entries
     // from persisting in Prometheus output (e.g. after snapshot restore
@@ -543,6 +546,7 @@ class MasterMetricManager {
 
     std::mutex storage_projection_mutex_;
     std::set<std::string> projected_mem_segments_;
+    std::set<std::string> projected_mem_footprint_segments_;
     std::set<std::string> projected_nof_segments_;
 
     // Memory Storage Metrics
@@ -556,6 +560,11 @@ class MasterMetricManager {
     ylt::metric::dynamic_gauge_1t
         mem_total_capacity_per_segment_;  // Segment memory capacity update for
                                           // gauge
+    // What the allocators have set aside, padding included
+    // (BufferAllocatorBase::footprint); set by project_storage_usage only.
+    ylt::metric::gauge_t mem_allocated_footprint_;
+    ylt::metric::dynamic_gauge_1t mem_allocated_footprint_per_segment_;
+    ylt::metric::dynamic_gauge_1t mem_largest_free_region_per_segment_;
 
     // NoF Segment Metrics
     ylt::metric::gauge_t
