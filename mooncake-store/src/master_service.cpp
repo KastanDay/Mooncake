@@ -1512,9 +1512,11 @@ bool MasterService::MakeRoomForWrite(const TenantId& tenant_id,
         deficit_bytes > overage ? deficit_bytes - overage : 0;
     auto refuse = [&] {
         {
+            // Every refused write wants its own room: the sum, capped per
+            // round (a refused write may be retried and counted again).
             std::lock_guard<std::mutex> lock(quota_trim_demand_mutex_);
             auto& demand = quota_trim_demand_[tenant_id];
-            demand = std::max(demand, own_bytes);
+            demand = std::min(demand + own_bytes, kInlineQuotaOverageBytes);
         }
         quota_trim_worker_.Schedule();
         return false;

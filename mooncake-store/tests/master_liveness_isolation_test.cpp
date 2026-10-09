@@ -1066,6 +1066,34 @@ TEST_F(MasterLivenessIsolationTest, WriteToLeasedTenantIsRefusedQuickly) {
     EXPECT_LT(took.count(), 200);
 }
 
+// Writes refused while a trim is due each add their own size to its demand:
+// the trim then makes room for all of them, not for one.
+TEST_F(MasterLivenessIsolationTest, RefusedWritesDemandsAdd) {
+    constexpr uint64_t kKiB = 1 << 10;
+    auto service = MakeQuotaService("demand", 4ULL << 30);
+    auto a = MountMemoryClient(*service, "demand_a", 0x100000000, 4ULL << 30);
+    for (int i = 0; i < 20000; ++i) {
+        ASSERT_TRUE(PutIn(*service, a, "demand", "demand_" + std::to_string(i),
+                          64 * kKiB));
+    }
+    StopQuotaTrimWorker(*service);
+    ASSERT_TRUE(
+        service->UpsertTenantQuotaPolicy(TenantId("demand"), 64ULL << 20));
+    for (int i = 0; i < 100; ++i) {  // Refused: the tenant is far over.
+        ASSERT_FALSE(PutIn(*service, a, "demand",
+                           "demand_new_" + std::to_string(i), 64 * kKiB));
+    }
+    TrimNow(*service);
+    // Room for all 100 refused writes, not just one.
+    EXPECT_LE(Charged(*service, "demand") + 100 * 64 * kKiB,
+              Effective(*service, "demand"));
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_TRUE(PutIn(*service, a, "demand",
+                          "demand_new_" + std::to_string(i), 64 * kKiB)
+                        .has_value());
+    }
+}
+
 // The steady state is unchanged: a tenant at its quota makes room for one
 // more write inline.
 TEST_F(MasterLivenessIsolationTest, WriteAtQuotaStillEvictsInline) {

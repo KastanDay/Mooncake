@@ -1014,7 +1014,7 @@ class MasterService {
     static constexpr size_t kInlineEvictionKeyBudget = 4096;
     // And at most this long: under shard contention (BatchEvict, a trim) an
     // eviction costs far more than its key count suggests.
-    static constexpr std::chrono::milliseconds kInlineEvictionTimeBudget{10};
+    static constexpr std::chrono::milliseconds kInlineEvictionTimeBudget{20};
     static constexpr uint64_t kInlineQuotaOverageBytes = 256ULL << 20;
     // quota_trim_worker_'s job: evicts every tenant down to its effective
     // quota, plus what refused writes asked for, a shard at a time.
