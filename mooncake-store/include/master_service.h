@@ -1069,9 +1069,23 @@ class MasterService {
     // admission would; a replica whose owner has none stays bound to none,
     // garbage for the first cleanup pass.
     void BindRestoredLocalDiskReplicas();
+    // snapshot_mutex_ held exclusively. A slow wait stalls the caller's RPC IO
+    // thread (and every client on it); a slow hold stalls every reader. Each
+    // is logged (over 100 ms) with the caller, so a stall can be attributed.
+    struct SnapshotWriteLock {
+        std::unique_lock<std::shared_mutex> lock;
+        const char* who;
+        std::chrono::steady_clock::time_point acquired;
+        SnapshotWriteLock(std::unique_lock<std::shared_mutex> l, const char* w)
+            : lock(std::move(l)),
+              who(w),
+              acquired(std::chrono::steady_clock::now()) {}
+        SnapshotWriteLock(SnapshotWriteLock&&) = default;
+        ~SnapshotWriteLock();
+    };
     // Takes snapshot_mutex_ exclusively, announcing the wait so the cleanup
     // pass steps aside between batches rather than starving the writer.
-    std::unique_lock<std::shared_mutex> LockSnapshotExclusive() const;
+    SnapshotWriteLock LockSnapshotExclusive(const char* who = "test") const;
     // Takes snapshot_mutex_ shared for one bounded section of a long pass
     // (a cleanup batch, one shard of an eviction), first stepping aside while
     // an exclusive writer waits: a remount or disk (un)mount waits for at most

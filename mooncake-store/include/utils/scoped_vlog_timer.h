@@ -31,11 +31,8 @@ class ScopedVLogTimer {
     ScopedVLogTimer(int level, std::string_view function_name)
         : level_(level),
           function_name_(function_name),
-          active_(VLOG_IS_ON(level_)) {
-        if (active_) {
-            start_time_ = std::chrono::steady_clock::now();
-        }
-    }
+          start_time_(std::chrono::steady_clock::now()),
+          active_(VLOG_IS_ON(level_)) {}
 
     // Call this *after* constructing the ScopedVLogTimer
     template <typename... Args>
@@ -111,8 +108,18 @@ class ScopedVLogTimer {
         }
     }
 
-    // Destructor logs *only* latency if LogResponse wasn't called
+    // Destructor logs *only* latency if LogResponse wasn't called. A call
+    // over kSlowMs is always logged: on the Master a synchronous RPC handler
+    // that slow holds its IO thread, stalling every client on that thread.
     ~ScopedVLogTimer() {
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start_time_)
+                .count();
+        if (elapsed_ms >= kSlowMs) {
+            LOG(WARNING) << "action=rpc_slow, rpc=" << function_name_
+                         << ", elapsed_ms=" << elapsed_ms;
+        }
         if (active_ && !logged_response_) {
             auto end_time = std::chrono::steady_clock::now();
             auto latency =
@@ -124,6 +131,7 @@ class ScopedVLogTimer {
     }
 
    private:
+    static constexpr int64_t kSlowMs = 500;
     int level_;
     std::string_view function_name_;
     std::chrono::steady_clock::time_point start_time_;

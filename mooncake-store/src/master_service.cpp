@@ -984,7 +984,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     {
         // snapshot_mutex_ first (the global lock order), so this never holds
         // client_mutex_ while it waits for a metadata pass to finish.
-        auto snapshot_lock = LockSnapshotExclusive();
+        auto snapshot_lock = LockSnapshotExclusive("ReMountSegment");
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
@@ -2676,8 +2676,8 @@ std::shared_lock<std::shared_mutex> MasterService::LockSnapshotForSection()
     return std::shared_lock<std::shared_mutex>(snapshot_mutex_);
 }
 
-std::unique_lock<std::shared_mutex> MasterService::LockSnapshotExclusive()
-    const {
+MasterService::SnapshotWriteLock MasterService::LockSnapshotExclusive(
+    const char* who) const {
     // Announced while waiting, so the cleanup pass, which re-takes the lock
     // shared for every batch, steps aside instead of starving the writer.
     struct Announce {
@@ -2687,7 +2687,30 @@ std::unique_lock<std::shared_mutex> MasterService::LockSnapshotExclusive()
         }
         ~Announce() { waiting.fetch_sub(1, std::memory_order_acq_rel); }
     } announce(snapshot_writers_waiting_);
-    return std::unique_lock<std::shared_mutex>(snapshot_mutex_);
+    const auto asked = std::chrono::steady_clock::now();
+    std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
+    const auto waited_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - asked)
+            .count();
+    if (waited_ms >= 100) {
+        LOG(WARNING) << "action=snapshot_exclusive_wait_slow, who=" << who
+                     << ", waited_ms=" << waited_ms;
+    }
+    return SnapshotWriteLock(std::move(lock), who);
+}
+
+MasterService::SnapshotWriteLock::~SnapshotWriteLock() {
+    if (!lock.owns_lock()) {
+        return;
+    }
+    const auto held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - acquired)
+                             .count();
+    if (held_ms >= 100) {
+        LOG(WARNING) << "action=snapshot_exclusive_hold_slow, who=" << who
+                     << ", held_ms=" << held_ms;
+    }
 }
 
 void MasterService::ClearStaleHandles(
@@ -2919,7 +2942,7 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
                                            const UUID& client_id,
                                            uint64_t grace_period_ms)
     -> tl::expected<void, ErrorCode> {
-    auto lock = LockSnapshotExclusive();
+    auto lock = LockSnapshotExclusive("GracefulUnmountSegment");
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     // Verify ownership: the segment must belong to the calling client
@@ -7508,7 +7531,7 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     // admission's own re-check under its shard lock already suffices.
     std::optional<int64_t> reported_capacity;
     {
-        auto snapshot_lock = LockSnapshotExclusive();
+        auto snapshot_lock = LockSnapshotExclusive("UnmountLocalDiskSegment");
         reported_capacity = local_ssd_manager_.UnregisterClient(client_id);
     }
     if (!reported_capacity) {
