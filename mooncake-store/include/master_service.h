@@ -472,21 +472,29 @@ class MasterService {
                                 const TenantId& tenant_id);
 
     /**
-     * @brief Placement state carried across the keys of one BatchPutStart:
-     * where its objects went, for the placement-span metric. A chunk is one
-     * mounted segment (allocator); an elastic Store mounts several 64 GiB
-     * chunks under one segment name.
+     * @brief Placement state carried across the keys of one BatchPutStart.
+     *
+     * With --colocate_batch_puts, the batch's first memory replica fixes an
+     * anchor allocator (one mounted segment, a 64 GiB chunk on an elastic
+     * Store), and every later object is placed in that chunk first, then in
+     * another chunk of the same Store, then by the allocation strategy. A
+     * prefix written in one batch then depends on one chunk instead of
+     * dozens. The anchor is weak: holding it must not keep an unmounted
+     * chunk's replicas readable.
      */
     struct BatchPlacement {
+        bool colocate{false};
         bool record_span{false};
+        std::weak_ptr<BufferAllocatorBase> anchor;
+        std::string anchor_segment;
         // Distinct chunks (allocator identities, never dereferenced) and
         // Stores (segment names) the batch's first memory replicas went to.
         std::vector<const void*> chunks;
         std::vector<std::string> stores;
     };
 
-    // Placement state for a new BatchPutStart, or nullopt when the churn
-    // metrics are disabled.
+    // Placement state for a new BatchPutStart, or nullopt when neither
+    // co-location nor the churn metrics are enabled.
     std::optional<BatchPlacement> BeginBatchPlacement() const;
     void EndBatchPlacement(const BatchPlacement& placement) const;
 

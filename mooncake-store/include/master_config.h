@@ -27,7 +27,7 @@ inline std::string ResolveConfiguredHABackendConnstring(
 }
 
 // The configuration for the master server
-// Churn measurement: phase P0 of
+// Churn measurement and batch co-location: phases P0 and A of
 // docs/source/design/store/hot-replica-churn.md. Off by default.
 struct KvChurnConfig {
     // Track per-object read heat and export the churn metrics.
@@ -37,6 +37,9 @@ struct KvChurnConfig {
     // the window's six slices can hold (4 bytes per slot, 2 slots per drop).
     uint32_t miss_window_seconds = 3600;
     uint64_t miss_slice_capacity = 1 << 20;
+    // Place each BatchPutStart object on the segment its predecessor in the
+    // batch went to, when that segment has room.
+    bool colocate_batch_puts = false;
 };
 
 struct MasterConfig {

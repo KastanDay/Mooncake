@@ -377,6 +377,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ", churn_miss_slice_capacity="
                   << kv_churn_config_.miss_slice_capacity;
     }
+    if (kv_churn_config_.colocate_batch_puts) {
+        LOG(INFO) << "Batch put co-location enabled: each BatchPutStart is "
+                     "placed in its first object's chunk first";
+    }
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     offload_on_evict_ = enable_offload_ && config.offload_on_evict;
@@ -4019,11 +4023,12 @@ void MasterService::RecordRetiredDisk(const UUID& client_id, ChurnCause cause) {
 
 auto MasterService::BeginBatchPlacement() const
     -> std::optional<BatchPlacement> {
-    if (!KvChurnMetricsEnabled()) {
+    if (!kv_churn_config_.colocate_batch_puts && !KvChurnMetricsEnabled()) {
         return std::nullopt;
     }
     BatchPlacement placement;
-    placement.record_span = true;
+    placement.colocate = kv_churn_config_.colocate_batch_puts;
+    placement.record_span = KvChurnMetricsEnabled();
     return placement;
 }
 
@@ -4635,15 +4640,50 @@ auto MasterService::AllocateAndInsertMetadata(
             }
         }
 
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_access, value_length, config.replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY);
+        // Co-location: the first replica goes next to the batch's anchor
+        // chunk if one has room. A client's own placement preference wins.
+        std::vector<Replica> anchored;
+        if (placement && placement->colocate &&
+            !placement->anchor_segment.empty() && preferred_segments.empty()) {
+            if (auto buffer = AllocateNearAnchor(
+                    allocator_manager, placement->anchor,
+                    placement->anchor_segment, value_length)) {
+                anchored.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING,
+                                      ReplicaType::MEMORY);
+            }
+        }
+        tl::expected<std::vector<Replica>, ErrorCode> allocation_result =
+            tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        if (anchored.empty()) {
+            allocation_result = allocation_strategy_->Allocate(
+                allocator_access, value_length, config.replica_num,
+                preferred_segments, std::set<std::string>(),
+                ReplicaType::MEMORY);
+        } else {
+            if (config.replica_num > 1) {
+                auto rest = allocation_strategy_->Allocate(
+                    allocator_access, value_length, config.replica_num - 1,
+                    preferred_segments, {placement->anchor_segment},
+                    ReplicaType::MEMORY);
+                if (rest.has_value()) {
+                    for (auto& replica : rest.value()) {
+                        anchored.push_back(std::move(replica));
+                    }
+                }
+            }
+            allocation_result = std::move(anchored);
+        }
         if (placement && allocation_result.has_value() &&
             !allocation_result->empty()) {
             const auto* weak = allocation_result->front().memory_allocator();
             const auto allocator = weak ? weak->lock() : nullptr;
             if (allocator) {
                 std::string segment = allocator->getSegmentName();
+                if (placement->colocate && placement->anchor_segment.empty()) {
+                    placement->anchor = allocator;
+                    placement->anchor_segment = segment;
+                }
                 if (placement->record_span) {
                     const void* chunk = allocator.get();
                     auto& chunks = placement->chunks;

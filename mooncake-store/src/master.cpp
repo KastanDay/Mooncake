@@ -200,6 +200,9 @@ DEFINE_uint32(churn_miss_window_seconds, 3600,
 DEFINE_uint64(churn_miss_slice_capacity, 1 << 20,
               "Dropped objects remembered per sixth of the churn-miss window "
               "(8 bytes each)");
+DEFINE_bool(colocate_batch_puts, false,
+            "Place each object of a batch put on the memory segment the "
+            "previous object of the batch went to, when it has room");
 DEFINE_uint64(offloading_queue_limit, 50000,
               "Maximum number of objects allowed in the offloading queue per "
               "local disk segment. Increase to allow more objects to be "
@@ -546,6 +549,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("churn_miss_slice_capacity",
                              &master_config.kv_churn.miss_slice_capacity,
                              FLAGS_churn_miss_slice_capacity);
+    default_config.GetBool("colocate_batch_puts",
+                           &master_config.kv_churn.colocate_batch_puts,
+                           FLAGS_colocate_batch_puts);
     {
         uint64_t tmp_offloading_queue_limit = FLAGS_offloading_queue_limit;
         default_config.GetUInt64("offloading_queue_limit",
@@ -946,6 +952,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.kv_churn.miss_slice_capacity =
             FLAGS_churn_miss_slice_capacity;
+    }
+    if ((google::GetCommandLineFlagInfo("colocate_batch_puts", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_churn.colocate_batch_puts = FLAGS_colocate_batch_puts;
     }
     if ((google::GetCommandLineFlagInfo("offloading_queue_limit", &info) &&
          !info.is_default) ||
@@ -1594,6 +1605,8 @@ int main(int argc, char* argv[]) {
         << master_config.kv_churn.miss_window_seconds
         << ", churn_miss_slice_capacity="
         << master_config.kv_churn.miss_slice_capacity
+        << ", colocate_batch_puts="
+        << master_config.kv_churn.colocate_batch_puts
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type
