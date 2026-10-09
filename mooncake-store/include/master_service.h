@@ -39,6 +39,7 @@
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
+#include "kv_churn.h"
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
@@ -103,6 +104,7 @@ class LocalDiskUnmountInterleavingTest;
 // Liveness isolated from metadata cleanup: holds the master's locks directly
 // to pin the interleavings (pass, remount, Ping) of the 2026-10-08 incident.
 class MasterLivenessIsolationTest;
+class KvChurnTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -167,6 +169,7 @@ class MasterService {
     friend class test::MasterServiceProcessingKeyDoubleEraseTest;
     friend class test::LocalDiskUnmountInterleavingTest;
     friend class test::MasterLivenessIsolationTest;
+    friend class test::KvChurnTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
@@ -469,6 +472,25 @@ class MasterService {
                                 const TenantId& tenant_id);
 
     /**
+     * @brief Placement state carried across the keys of one BatchPutStart:
+     * where its objects went, for the placement-span metric. A chunk is one
+     * mounted segment (allocator); an elastic Store mounts several 64 GiB
+     * chunks under one segment name.
+     */
+    struct BatchPlacement {
+        bool record_span{false};
+        // Distinct chunks (allocator identities, never dereferenced) and
+        // Stores (segment names) the batch's first memory replicas went to.
+        std::vector<const void*> chunks;
+        std::vector<std::string> stores;
+    };
+
+    // Placement state for a new BatchPutStart, or nullopt when the churn
+    // metrics are disabled.
+    std::optional<BatchPlacement> BeginBatchPlacement() const;
+    void EndBatchPlacement(const BatchPlacement& placement) const;
+
+    /**
      * @brief Start a put operation for an object
      * @param[out] replica_list Vector to store replica information for the
      * slice
@@ -478,7 +500,8 @@ class MasterService {
      */
     auto PutStart(const UUID& client_id, const std::string& key,
                   const TenantId& tenant_id, const uint64_t slice_length,
-                  const ReplicateConfig& config)
+                  const ReplicateConfig& config,
+                  BatchPlacement* placement = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -1182,6 +1205,10 @@ class MasterService {
         const std::string user_key;
 
         mutable SpinLock lock;
+        // Decayed read count (kv_heat): kept only with
+        // --enable_kv_churn_metrics. Atomic, so reads under a shared shard
+        // lock update it.
+        mutable std::atomic<uint32_t> read_heat{0};
         // Default constructor, creates a time_point representing
         // the Clock's epoch (i.e., time_since_epoch() is zero).
         mutable std::chrono::system_clock::time_point lease_timeout
@@ -2070,7 +2097,8 @@ class MasterService {
         const ResolvedSoftPinRequest& soft_pin_request,
         uint64_t& quota_deficit_bytes,
         std::optional<std::chrono::system_clock::time_point>
-            committed_soft_pin_timeout = std::nullopt)
+            committed_soft_pin_timeout = std::nullopt,
+        BatchPlacement* placement = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -2497,6 +2525,15 @@ class MasterService {
         // Get metadata (only call when Exists() is true)
         const ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS {
             return it_->second;
+        }
+
+        // The metadata even when it is not valid (every replica lost and
+        // not yet cleaned up), or nullptr if there is none.
+        const ObjectMetadata* Find() const NO_THREAD_SAFETY_ANALYSIS {
+            return tenant_state_ != nullptr &&
+                           it_ != tenant_state_->metadata.end()
+                       ? &it_->second
+                       : nullptr;
         }
 
         MetadataShardAccessorRO& GetShard() NO_THREAD_SAFETY_ANALYSIS {
@@ -2956,6 +2993,33 @@ class MasterService {
 
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
+
+    // Churn measurement (--enable_kv_churn_metrics; kv_churn.h).
+    bool KvChurnMetricsEnabled() const { return churn_filter_ != nullptr; }
+    uint16_t HeatEpochNow() const;
+    // Counts one served read of `metadata`.
+    void RecordKvRead(const ObjectMetadata& metadata, uint16_t epoch) const;
+    size_t HeatBucketNow(const ObjectMetadata& metadata) const;
+    // The cause of the first replica `metadata` lost to churn (a released
+    // memory segment or a retired disk registration), or nullopt if it lost
+    // none.
+    std::optional<ChurnCause> ChurnLossCause(
+        const ObjectMetadata& metadata) const;
+    // `metadata` lost its last servable copy: count it and remember it.
+    void RecordChurnDrop(const TenantId& tenant_id, const std::string& key,
+                         ChurnCause cause, const ObjectMetadata& metadata);
+    // Explains a lookup miss on `key`. `metadata` is the object's metadata
+    // if it still exists (lost, awaiting cleanup), else nullptr.
+    std::optional<ChurnMiss> ExplainChurnMiss(
+        const TenantId& tenant_id, const std::string& key,
+        const ObjectMetadata* metadata) const;
+    void RecordRetiredSegment(const std::shared_ptr<BufferAllocatorBase>& alloc,
+                              ChurnCause cause);
+    void RecordRetiredDisk(const UUID& client_id, ChurnCause cause);
+
+    KvChurnConfig kv_churn_config_;
+    std::unique_ptr<ChurnMissFilter> churn_filter_;
+    std::unique_ptr<ChurnLossRegistry> churn_losses_;
     // A completed LOCAL_DISK replica whose registration is current: the only
     // kind that may be served, promoted from, or counted as an eviction
     // backup.

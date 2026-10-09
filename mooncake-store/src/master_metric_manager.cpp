@@ -7,6 +7,7 @@
 #include <vector>   // Required by histogram serialization
 #include <cmath>
 
+#include "kv_churn.h"
 #include "segment.h"
 #include "utils.h"
 
@@ -2026,6 +2027,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(snapshot_duration_ms_);
     serialize_metric(snapshot_success_);
     serialize_metric(snapshot_fail_);
+
+    ss << KvChurnMetrics::instance().Serialize();
 
     return ss.str();
 }
