@@ -493,11 +493,17 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             }
         }
     } else {
+        // The placement-span metric follows the batch across its keys.
+        auto placement = master_service_.BeginBatchPlacement();
         for (size_t i = 0; i < keys.size(); ++i) {
             auto key_config = config.ForSingleKey(i);
             results.emplace_back(master_service_.PutStart(
                 client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config));
+                slice_lengths[i], key_config,
+                placement ? &*placement : nullptr));
+        }
+        if (placement) {
+            master_service_.EndBatchPlacement(*placement);
         }
     }
 

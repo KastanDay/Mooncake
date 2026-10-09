@@ -70,6 +70,13 @@ class AllocatedBuffer {
         return !allocator_.expired();
     }
 
+    // The allocator (one mounted segment) this buffer came from. It stays
+    // comparable by owner after the segment is released.
+    [[nodiscard]] const std::weak_ptr<BufferAllocatorBase>& allocator()
+        const noexcept {
+        return allocator_;
+    }
+
     // Serialize the buffer into a descriptor for transfer
     [[nodiscard]] Descriptor get_descriptor() const;
 
