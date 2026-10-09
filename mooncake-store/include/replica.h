@@ -463,6 +463,16 @@ class Replica {
         return false;  // DiskReplicaData does not have handles
     }
 
+    // The allocator a memory replica's buffer came from, or nullptr for
+    // other replica types.
+    [[nodiscard]] const std::weak_ptr<BufferAllocatorBase>* memory_allocator()
+        const {
+        if (const auto* mem_data = std::get_if<MemoryReplicaData>(&data_)) {
+            return &mem_data->buffer->allocator();
+        }
+        return nullptr;
+    }
+
     bool replace_memory_buffer(std::unique_ptr<AllocatedBuffer> buffer) {
         if (!buffer || !is_memory_replica()) {
             return false;

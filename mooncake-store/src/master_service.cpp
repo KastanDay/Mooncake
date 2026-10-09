@@ -360,6 +360,28 @@ MasterService::MasterService(const MasterServiceConfig& config)
     };
 #endif
 
+    kv_churn_config_ = config.kv_churn;
+    kv_churn_config_.heat_half_life_seconds =
+        std::max<uint32_t>(1, kv_churn_config_.heat_half_life_seconds);
+    if (kv_churn_config_.enable_metrics) {
+        const std::chrono::seconds window(
+            std::max<uint32_t>(1, kv_churn_config_.miss_window_seconds));
+        churn_filter_ = std::make_unique<ChurnMissFilter>(
+            window, kv_churn_config_.miss_slice_capacity);
+        // Cleanup can lag the event that released a segment.
+        churn_losses_ = std::make_unique<ChurnLossRegistry>(
+            window + std::chrono::minutes(10));
+        LOG(INFO) << "KV churn metrics enabled: heat_half_life_seconds="
+                  << kv_churn_config_.heat_half_life_seconds
+                  << ", churn_miss_window_seconds=" << window.count()
+                  << ", churn_miss_slice_capacity="
+                  << kv_churn_config_.miss_slice_capacity;
+    }
+    if (kv_churn_config_.colocate_batch_puts) {
+        LOG(INFO) << "Batch put co-location enabled: each BatchPutStart is "
+                     "placed in its first object's chunk first";
+    }
+
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     offload_on_evict_ = enable_offload_ && config.offload_on_evict;
     if (offload_on_evict_) {
@@ -2733,11 +2755,26 @@ void MasterService::ClearStaleHandles(
                        const TenantId& tenant_id, TenantState& tenant_state,
                        MetadataMap::iterator it) {
         if (!(enable_ha_ && enable_oplog_)) {
+            // Churn metrics: classified before the lost replicas are removed.
+            const auto churn_cause = KvChurnMetricsEnabled()
+                                         ? ChurnLossCause(it->second)
+                                         : std::nullopt;
             if (CleanupStaleHandles(tenant_state, it->second, is_stale,
                                     &shard) ||
                 !it->second.IsValid()) {
+                if (churn_cause) {
+                    RecordChurnDrop(tenant_id, it->first, *churn_cause,
+                                    it->second);
+                }
                 EraseMetadata(tenant_state, it, tenant_id,
                               QuotaEraseMode::kFull, &shard);
+            } else if (churn_cause) {
+                if (HasReadableReplica(it->second)) {
+                    KvChurnMetrics::instance().ObserveDegraded(*churn_cause);
+                } else {
+                    RecordChurnDrop(tenant_id, it->first, *churn_cause,
+                                    it->second);
+                }
             }
             return;
         }
@@ -2899,6 +2936,9 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
+        // Recorded before release, so its replicas' loss is attributed.
+        RecordRetiredSegment(segment_access.GetAllocator(segment_id),
+                             ChurnCause::kUnmount);
         ErrorCode err = segment_access.PrepareUnmountSegment(
             segment_id, metrics_dec_capacity);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
@@ -3043,15 +3083,25 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
 auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
     -> tl::expected<bool, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRO accessor(this,
-                                MakeObjectIdentityForRequest(key, tenant_id));
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    MetadataAccessorRO accessor(this, object_id);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
+        if (KvChurnMetricsEnabled()) {
+            KvChurnMetrics::instance().ObserveMiss(
+                "exist", ExplainChurnMiss(object_id.tenant_id,
+                                          object_id.user_key, accessor.Find()));
+        }
         return false;
     }
 
     const auto& metadata = accessor.Get();
     if (!HasReadableReplica(metadata)) {
+        if (KvChurnMetricsEnabled()) {
+            KvChurnMetrics::instance().ObserveMiss(
+                "exist", ExplainChurnMiss(object_id.tenant_id,
+                                          object_id.user_key, &metadata));
+        }
         return false;
     }
 
@@ -3088,6 +3138,16 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
         }
     }
 
+    // Churn metrics: why each missing key is missing. Keys whose metadata
+    // is gone are looked up in the churn-miss filter after the shard locks.
+    const bool churn = KvChurnMetricsEnabled();
+    std::vector<std::optional<ChurnMiss>> explained;
+    std::vector<uint8_t> explain_later;
+    if (churn) {
+        explained.resize(keys.size());
+        explain_later.assign(keys.size(), 0);
+    }
+
     const size_t start_shard = randomIndex(kNumShards);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
@@ -3106,6 +3166,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
                         << ", tenant_id=" << normalized_tenant
                         << ", info=object_not_found";
                 results[i] = false;
+                if (churn) explain_later[i] = 1;
             }
             continue;
         }
@@ -3118,17 +3179,50 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
                 VLOG(1) << "key=" << key << ", tenant_id=" << normalized_tenant
                         << ", info=object_not_found";
                 results[i] = false;
+                if (churn && it == tenant_state.metadata.end()) {
+                    explain_later[i] = 1;
+                } else if (churn) {
+                    explained[i] =
+                        ExplainChurnMiss(normalized_tenant, key, &it->second);
+                }
                 continue;
             }
 
             const auto& metadata = it->second;
             if (!HasReadableReplica(metadata)) {
                 results[i] = false;
+                if (churn) {
+                    explained[i] =
+                        ExplainChurnMiss(normalized_tenant, key, &metadata);
+                }
                 continue;
             }
             GrantLeaseForGroup(tenant_state, key, metadata);
             results[i] = true;
         }
+    }
+
+    if (churn) {
+        // Keys are in prefix order for SGLang's batch_exists, which uses a
+        // prefix only up to its first missing key.
+        size_t first_miss = keys.size();
+        size_t stranded = 0;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const bool present = results[i].has_value() && results[i].value();
+            if (present) {
+                stranded += first_miss < i;
+                continue;
+            }
+            if (explain_later[i]) {
+                explained[i] =
+                    ExplainChurnMiss(normalized_tenant, keys[i], nullptr);
+            }
+            KvChurnMetrics::instance().ObserveMiss("exist", explained[i]);
+            first_miss = std::min(first_miss, i);
+        }
+        KvChurnMetrics::instance().ObserveBatchExist(
+            std::min(first_miss, keys.size()), stranded,
+            first_miss < keys.size() ? &explained[first_miss] : nullptr);
     }
     return results;
 }
@@ -3844,6 +3938,111 @@ bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
         [this](const Replica& replica) { return IsReplicaReadable(replica); });
 }
 
+uint16_t MasterService::HeatEpochNow() const {
+    const auto seconds =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    return static_cast<uint16_t>(seconds /
+                                 kv_churn_config_.heat_half_life_seconds);
+}
+
+void MasterService::RecordKvRead(const ObjectMetadata& metadata,
+                                 uint16_t epoch) const {
+    const auto [before, after] = kv_heat::RecordRead(metadata.read_heat, epoch);
+    KvChurnMetrics::instance().ObserveRead(before, after, metadata.size);
+}
+
+size_t MasterService::HeatBucketNow(const ObjectMetadata& metadata) const {
+    return HeatBucket(kv_heat::Decayed(
+        metadata.read_heat.load(std::memory_order_relaxed), HeatEpochNow()));
+}
+
+std::optional<ChurnCause> MasterService::ChurnLossCause(
+    const ObjectMetadata& metadata) const {
+    std::optional<ChurnCause> cause;
+    metadata.VisitReplicas(
+        [](const Replica& replica) { return replica.is_completed(); },
+        [&](const Replica& replica) {
+            if (cause) {
+                return;
+            }
+            if (const auto* allocator = replica.memory_allocator()) {
+                if (allocator->expired()) {
+                    cause = churn_losses_->AllocatorCause(*allocator);
+                }
+            } else if (replica.is_local_disk_replica() &&
+                       !IsLocalDiskRegistrationCurrent(replica)) {
+                cause = churn_losses_->DiskOwnerCause(
+                    replica.get_local_disk_client_id().value());
+            }
+        });
+    return cause;
+}
+
+void MasterService::RecordChurnDrop(const TenantId& tenant_id,
+                                    const std::string& key, ChurnCause cause,
+                                    const ObjectMetadata& metadata) {
+    const size_t heat_bucket = HeatBucketNow(metadata);
+    KvChurnMetrics::instance().ObserveDrop(cause, heat_bucket, metadata.size);
+    if (!churn_filter_->Insert(ChurnKeyHash(tenant_id.value(), key), cause,
+                               heat_bucket, std::chrono::steady_clock::now())) {
+        KvChurnMetrics::instance().ObserveFilterOverflow();
+    }
+}
+
+std::optional<ChurnMiss> MasterService::ExplainChurnMiss(
+    const TenantId& tenant_id, const std::string& key,
+    const ObjectMetadata* metadata) const {
+    if (metadata != nullptr) {
+        const auto cause = ChurnLossCause(*metadata);
+        if (!cause) {
+            return std::nullopt;  // not yet written, or removed on purpose
+        }
+        return ChurnMiss{*cause, HeatBucketNow(*metadata),
+                         ChurnMiss::kPendingAge};
+    }
+    const auto hit = churn_filter_->Find(ChurnKeyHash(tenant_id.value(), key),
+                                         std::chrono::steady_clock::now());
+    if (!hit) {
+        return std::nullopt;
+    }
+    return ChurnMiss{hit->cause, hit->heat_bucket, hit->age_slice};
+}
+
+void MasterService::RecordRetiredSegment(
+    const std::shared_ptr<BufferAllocatorBase>& allocator, ChurnCause cause) {
+    if (churn_losses_ && allocator) {
+        churn_losses_->RecordAllocator(allocator, cause,
+                                       std::chrono::steady_clock::now());
+    }
+}
+
+void MasterService::RecordRetiredDisk(const UUID& client_id, ChurnCause cause) {
+    if (churn_losses_) {
+        churn_losses_->RecordDiskOwner(client_id, cause,
+                                       std::chrono::steady_clock::now());
+    }
+}
+
+auto MasterService::BeginBatchPlacement() const
+    -> std::optional<BatchPlacement> {
+    if (!kv_churn_config_.colocate_batch_puts && !KvChurnMetricsEnabled()) {
+        return std::nullopt;
+    }
+    BatchPlacement placement;
+    placement.colocate = kv_churn_config_.colocate_batch_puts;
+    placement.record_span = KvChurnMetricsEnabled();
+    return placement;
+}
+
+void MasterService::EndBatchPlacement(const BatchPlacement& placement) const {
+    if (placement.record_span && !placement.chunks.empty()) {
+        KvChurnMetrics::instance().ObserveBatchSpan(
+            "put", placement.chunks.size(), placement.stores.size());
+    }
+}
+
 bool MasterService::IsEvictableMemoryReplica(const Replica& replica) const {
     return replica.is_memory_replica() && IsReplicaReadable(replica) &&
            replica.get_refcnt() == 0;
@@ -3916,6 +4115,12 @@ auto MasterService::GetReplicaList(const std::string& key,
 
         if (!accessor.Exists()) {
             VLOG(1) << "key=" << key << ", info=object_not_found";
+            if (KvChurnMetricsEnabled()) {
+                KvChurnMetrics::instance().ObserveMiss(
+                    "get",
+                    ExplainChurnMiss(object_id.tenant_id, object_id.user_key,
+                                     accessor.Find()));
+            }
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         const auto& metadata = accessor.Get();
@@ -3935,6 +4140,11 @@ auto MasterService::GetReplicaList(const std::string& key,
             });
 
         if (replica_list.empty()) {
+            if (KvChurnMetricsEnabled()) {
+                KvChurnMetrics::instance().ObserveMiss(
+                    "get", ExplainChurnMiss(object_id.tenant_id,
+                                            object_id.user_key, &metadata));
+            }
             if (metadata.AllReplicas([](const Replica& replica) {
                     return replica.status() == ReplicaStatus::REMOVED;
                 })) {
@@ -3942,6 +4152,9 @@ auto MasterService::GetReplicaList(const std::string& key,
             }
             LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+        }
+        if (KvChurnMetricsEnabled()) {
+            RecordKvRead(metadata, HeatEpochNow());
         }
 
         // TODO: NoF SSD support (ranhaojia)
@@ -4072,6 +4285,15 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
     }
 
+    // Churn metrics: heat on every served key, the miss explanations (keys
+    // whose metadata is gone are looked up after the shard locks), and the
+    // chunks and Stores the batch's memory replicas are on.
+    const bool churn = KvChurnMetricsEnabled();
+    const uint16_t heat_epoch = churn ? HeatEpochNow() : 0;
+    std::vector<size_t> explain_later;
+    std::vector<const void*> span_chunks;
+    std::vector<std::string> span_stores;
+
     const size_t start_shard = randomIndex(kNumShards);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
@@ -4097,6 +4319,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     VLOG(1) << "key=" << key << ", info=object_not_found";
                     results[original_idx] =
                         tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                    if (churn) explain_later.push_back(original_idx);
                     continue;
                 }
 
@@ -4107,18 +4330,57 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     VLOG(1) << "key=" << key << ", info=object_not_found";
                     results[original_idx] =
                         tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                    if (churn && metadata_it == tenant_state.metadata.end()) {
+                        explain_later.push_back(original_idx);
+                    } else if (churn) {
+                        KvChurnMetrics::instance().ObserveMiss(
+                            "get", ExplainChurnMiss(normalized_tenant, key,
+                                                    &metadata_it->second));
+                    }
                     continue;
                 }
 
                 const auto& metadata = metadata_it->second;
                 std::vector<Replica::Descriptor> replica_list;
+                const Replica* first_memory_replica = nullptr;
                 metadata.VisitReplicas(
                     [this](const Replica& replica) {
                         return IsReplicaReadable(replica);
                     },
-                    [&replica_list](const Replica& replica) {
+                    [&replica_list,
+                     &first_memory_replica](const Replica& replica) {
                         replica_list.emplace_back(replica.get_descriptor());
+                        if (!first_memory_replica &&
+                            replica.is_memory_replica()) {
+                            first_memory_replica = &replica;
+                        }
                     });
+
+                if (churn) {
+                    if (replica_list.empty()) {
+                        KvChurnMetrics::instance().ObserveMiss(
+                            "get", ExplainChurnMiss(normalized_tenant, key,
+                                                    &metadata));
+                    } else {
+                        RecordKvRead(metadata, heat_epoch);
+                    }
+                    const auto allocator =
+                        first_memory_replica
+                            ? first_memory_replica->memory_allocator()->lock()
+                            : nullptr;
+                    if (allocator) {
+                        const void* chunk = allocator.get();
+                        if (std::find(span_chunks.begin(), span_chunks.end(),
+                                      chunk) == span_chunks.end()) {
+                            span_chunks.push_back(chunk);
+                        }
+                        std::string store = allocator->getSegmentName();
+                        if (std::find(span_stores.begin(), span_stores.end(),
+                                      store) == span_stores.end()) {
+                            span_stores.push_back(std::move(store));
+                        }
+                    }
+                }
 
                 if (replica_list.empty()) {
                     if (metadata.AllReplicas([](const Replica& replica) {
@@ -4197,6 +4459,16 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
     }
 
+    if (churn) {
+        for (const size_t i : explain_later) {
+            KvChurnMetrics::instance().ObserveMiss(
+                "get", ExplainChurnMiss(normalized_tenant, keys[i], nullptr));
+        }
+        if (!span_chunks.empty()) {
+            KvChurnMetrics::instance().ObserveBatchSpan(
+                "get", span_chunks.size(), span_stores.size());
+        }
+    }
     return results;
 }
 
@@ -4303,7 +4575,8 @@ auto MasterService::AllocateAndInsertMetadata(
     const ResolvedSoftPinRequest& soft_pin_request,
     uint64_t& quota_deficit_bytes,
     std::optional<std::chrono::system_clock::time_point>
-        committed_soft_pin_timeout)
+        committed_soft_pin_timeout,
+    BatchPlacement* placement)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto deadline_to_index = committed_soft_pin_timeout;
     auto& tenant_state = GetOrCreateTenantState(shard.get(), tenant_id);
@@ -4371,9 +4644,65 @@ auto MasterService::AllocateAndInsertMetadata(
             }
         }
 
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_access, value_length, config.replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY);
+        // Co-location: the first replica goes next to the batch's anchor
+        // chunk if one has room. A client's own placement preference wins.
+        std::vector<Replica> anchored;
+        if (placement && placement->colocate &&
+            !placement->anchor_segment.empty() && preferred_segments.empty()) {
+            if (auto buffer = AllocateNearAnchor(
+                    allocator_manager, placement->anchor,
+                    placement->anchor_segment, value_length)) {
+                anchored.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING,
+                                      ReplicaType::MEMORY);
+            }
+        }
+        tl::expected<std::vector<Replica>, ErrorCode> allocation_result =
+            tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        if (anchored.empty()) {
+            allocation_result = allocation_strategy_->Allocate(
+                allocator_access, value_length, config.replica_num,
+                preferred_segments, std::set<std::string>(),
+                ReplicaType::MEMORY);
+        } else {
+            if (config.replica_num > 1) {
+                auto rest = allocation_strategy_->Allocate(
+                    allocator_access, value_length, config.replica_num - 1,
+                    preferred_segments, {placement->anchor_segment},
+                    ReplicaType::MEMORY);
+                if (rest.has_value()) {
+                    for (auto& replica : rest.value()) {
+                        anchored.push_back(std::move(replica));
+                    }
+                }
+            }
+            allocation_result = std::move(anchored);
+        }
+        if (placement && allocation_result.has_value() &&
+            !allocation_result->empty()) {
+            const auto* weak = allocation_result->front().memory_allocator();
+            const auto allocator = weak ? weak->lock() : nullptr;
+            if (allocator) {
+                std::string segment = allocator->getSegmentName();
+                if (placement->colocate && placement->anchor_segment.empty()) {
+                    placement->anchor = allocator;
+                    placement->anchor_segment = segment;
+                }
+                if (placement->record_span) {
+                    const void* chunk = allocator.get();
+                    auto& chunks = placement->chunks;
+                    if (std::find(chunks.begin(), chunks.end(), chunk) ==
+                        chunks.end()) {
+                        chunks.push_back(chunk);
+                    }
+                    auto& stores = placement->stores;
+                    if (std::find(stores.begin(), stores.end(), segment) ==
+                        stores.end()) {
+                        stores.push_back(std::move(segment));
+                    }
+                }
+            }
+        }
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
@@ -4568,7 +4897,8 @@ auto MasterService::AllocateAndInsertMetadata(
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const TenantId& tenant_id,
                              const uint64_t slice_length,
-                             const ReplicateConfig& config)
+                             const ReplicateConfig& config,
+                             BatchPlacement* placement)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
@@ -4740,7 +5070,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     return AllocateAndInsertMetadata(
                         shard, client_id, key, slice_length, config,
                         writer_host_id, group_id, object_id.tenant_id, now,
-                        *soft_pin_request, quota_deficit_bytes);
+                        *soft_pin_request, quota_deficit_bytes, std::nullopt,
+                        placement);
                 }
             }
         }
@@ -4758,7 +5089,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return AllocateAndInsertMetadata(
             shard, client_id, key, slice_length, config, writer_host_id,
             group_id, object_id.tenant_id, now, *soft_pin_request,
-            quota_deficit_bytes);
+            quota_deficit_bytes, std::nullopt, placement);
     };
 
     for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
@@ -7541,6 +7872,7 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     // admitted under the old registration; with background cleanup the
     // admission's own re-check under its shard lock already suffices.
     std::optional<int64_t> reported_capacity;
+    RecordRetiredDisk(client_id, ChurnCause::kDiskUnmount);
     {
         auto snapshot_lock = LockSnapshotExclusive("UnmountLocalDiskSegment");
         reported_capacity = local_ssd_manager_.UnregisterClient(client_id);
@@ -11535,6 +11867,8 @@ void MasterService::ExpireClients(const std::vector<UUID>& candidates,
                 segment_access.GetClientSegments(client_id, segments);
                 for (const auto& seg : segments) {
                     size_t metrics_dec_capacity = 0;
+                    RecordRetiredSegment(segment_access.GetAllocator(seg.id),
+                                         ChurnCause::kClientExpiry);
                     if (segment_access.PrepareUnmountSegment(
                             seg.id, metrics_dec_capacity) == ErrorCode::OK) {
                         unmount_segments.push_back(seg.id);
@@ -11557,6 +11891,7 @@ void MasterService::ExpireClients(const std::vector<UUID>& candidates,
         // re-checks its generation under its shard lock, so it either lands
         // before the cleanup pass reaches its shard or is refused.
         for (const auto& client_id : expired_clients) {
+            RecordRetiredDisk(client_id, ChurnCause::kClientExpiry);
             auto capacity = local_ssd_manager_.UnregisterClient(client_id);
             if (capacity && *capacity > 0) {
                 MasterMetricManager::instance().dec_total_file_capacity(
@@ -13365,6 +13700,12 @@ void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
         });
     MasterMetricManager::instance().observe_replica_eviction(
         medium, freed_bytes, metadata.size, servable_remaining);
+    if (KvChurnMetricsEnabled() && freed_bytes > 0 && !servable_remaining) {
+        RecordChurnDrop(tenant_id, key,
+                        medium == "disk" ? ChurnCause::kEvictDisk
+                                         : ChurnCause::kEvictMemory,
+                        metadata);
+    }
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }

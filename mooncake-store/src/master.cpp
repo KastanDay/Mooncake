@@ -189,6 +189,20 @@ DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
             "Force-evict objects exceeding offload cap without disk offload");
+DEFINE_bool(enable_kv_churn_metrics, false,
+            "Track per-object read heat and export metrics on what Store "
+            "churn costs the cache (master_kv_* metrics)");
+DEFINE_uint32(hot_heat_half_life_seconds, 600,
+              "Half-life of an object's read heat, in seconds");
+DEFINE_uint32(churn_miss_window_seconds, 3600,
+              "How long an object dropped by churn is remembered, so a later "
+              "miss on it is counted as a churn miss");
+DEFINE_uint64(churn_miss_slice_capacity, 1 << 20,
+              "Dropped objects remembered per sixth of the churn-miss window "
+              "(8 bytes each)");
+DEFINE_bool(colocate_batch_puts, false,
+            "Place each object of a batch put on the memory segment the "
+            "previous object of the batch went to, when it has room");
 DEFINE_uint64(offloading_queue_limit, 50000,
               "Maximum number of objects allowed in the offloading queue per "
               "local disk segment. Increase to allow more objects to be "
@@ -523,6 +537,21 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_force_evict",
                            &master_config.offload_force_evict,
                            FLAGS_offload_force_evict);
+    default_config.GetBool("enable_kv_churn_metrics",
+                           &master_config.kv_churn.enable_metrics,
+                           FLAGS_enable_kv_churn_metrics);
+    default_config.GetUInt32("hot_heat_half_life_seconds",
+                             &master_config.kv_churn.heat_half_life_seconds,
+                             FLAGS_hot_heat_half_life_seconds);
+    default_config.GetUInt32("churn_miss_window_seconds",
+                             &master_config.kv_churn.miss_window_seconds,
+                             FLAGS_churn_miss_window_seconds);
+    default_config.GetUInt64("churn_miss_slice_capacity",
+                             &master_config.kv_churn.miss_slice_capacity,
+                             FLAGS_churn_miss_slice_capacity);
+    default_config.GetBool("colocate_batch_puts",
+                           &master_config.kv_churn.colocate_batch_puts,
+                           FLAGS_colocate_batch_puts);
     {
         uint64_t tmp_offloading_queue_limit = FLAGS_offloading_queue_limit;
         default_config.GetUInt64("offloading_queue_limit",
@@ -900,6 +929,34 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.offload_force_evict = FLAGS_offload_force_evict;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_kv_churn_metrics", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_churn.enable_metrics = FLAGS_enable_kv_churn_metrics;
+    }
+    if ((google::GetCommandLineFlagInfo("hot_heat_half_life_seconds", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_churn.heat_half_life_seconds =
+            FLAGS_hot_heat_half_life_seconds;
+    }
+    if ((google::GetCommandLineFlagInfo("churn_miss_window_seconds", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_churn.miss_window_seconds =
+            FLAGS_churn_miss_window_seconds;
+    }
+    if ((google::GetCommandLineFlagInfo("churn_miss_slice_capacity", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_churn.miss_slice_capacity =
+            FLAGS_churn_miss_slice_capacity;
+    }
+    if ((google::GetCommandLineFlagInfo("colocate_batch_puts", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_churn.colocate_batch_puts = FLAGS_colocate_batch_puts;
     }
     if ((google::GetCommandLineFlagInfo("offloading_queue_limit", &info) &&
          !info.is_default) ||
@@ -1541,6 +1598,15 @@ int main(int argc, char* argv[]) {
         << ", kv_events_backend_id=" << master_config.kv_events_backend_id
         << ", offload_on_evict=" << master_config.offload_on_evict
         << ", offload_force_evict=" << master_config.offload_force_evict
+        << ", enable_kv_churn_metrics=" << master_config.kv_churn.enable_metrics
+        << ", hot_heat_half_life_seconds="
+        << master_config.kv_churn.heat_half_life_seconds
+        << ", churn_miss_window_seconds="
+        << master_config.kv_churn.miss_window_seconds
+        << ", churn_miss_slice_capacity="
+        << master_config.kv_churn.miss_slice_capacity
+        << ", colocate_batch_puts="
+        << master_config.kv_churn.colocate_batch_puts
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type

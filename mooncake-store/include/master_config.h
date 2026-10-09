@@ -27,6 +27,21 @@ inline std::string ResolveConfiguredHABackendConnstring(
 }
 
 // The configuration for the master server
+// Churn measurement and batch co-location: phases P0 and A of
+// docs/source/design/store/hot-replica-churn.md. Off by default.
+struct KvChurnConfig {
+    // Track per-object read heat and export the churn metrics.
+    bool enable_metrics = false;
+    uint32_t heat_half_life_seconds = 600;
+    // How long a dropped object is remembered, and how many drops each of
+    // the window's six slices can hold (4 bytes per slot, 2 slots per drop).
+    uint32_t miss_window_seconds = 3600;
+    uint64_t miss_slice_capacity = 1 << 20;
+    // Place each BatchPutStart object on the segment its predecessor in the
+    // batch went to, when that segment has room.
+    bool colocate_batch_puts = false;
+};
+
 struct MasterConfig {
     bool enable_metric_reporting;
     uint32_t metrics_port;
@@ -126,6 +141,7 @@ struct MasterConfig {
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    KvChurnConfig kv_churn;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
 
@@ -243,6 +259,7 @@ class MasterServiceSupervisorConfig {
     bool enable_cxl = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    KvChurnConfig kv_churn;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
@@ -303,6 +320,7 @@ class MasterServiceSupervisorConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        kv_churn = config.kv_churn;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
@@ -499,6 +517,7 @@ class WrappedMasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    KvChurnConfig kv_churn;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
@@ -593,6 +612,7 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        kv_churn = config.kv_churn;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
@@ -717,6 +737,7 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        kv_churn = config.kv_churn;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
@@ -1176,6 +1197,7 @@ class MasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    KvChurnConfig kv_churn;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
@@ -1266,6 +1288,7 @@ class MasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        kv_churn = config.kv_churn;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
