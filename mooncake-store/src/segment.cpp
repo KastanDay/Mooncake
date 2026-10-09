@@ -4,6 +4,7 @@
 #include "master_metric_manager.h"
 #include "utils/zstd_util.h"
 
+#include <algorithm>
 #include <functional>
 #include <unordered_set>
 
@@ -106,14 +107,30 @@ void AddAllocatorUsage(
 
     const size_t used_bytes = allocator->size();
     const size_t capacity_bytes = allocator->capacity();
+    const auto footprint = allocator->footprint();
     snapshot.used_bytes += used_bytes;
     snapshot.capacity_bytes += capacity_bytes;
+    snapshot.footprint_bytes +=
+        footprint ? footprint->reserved_bytes : used_bytes;
 
     const std::string segment_name = allocator->getSegmentName();
     if (!segment_name.empty()) {
+        const bool first_allocator = !snapshot.segments.contains(segment_name);
         auto& segment = snapshot.segments[segment_name];
         segment.used_bytes += used_bytes;
         segment.capacity_bytes += capacity_bytes;
+        // A segment is reported only if every one of its allocators has a
+        // footprint; a partial sum would read as a smaller footprint.
+        if (!footprint) {
+            snapshot.segment_footprints.erase(segment_name);
+        } else if (first_allocator ||
+                   snapshot.segment_footprints.contains(segment_name)) {
+            auto& total = snapshot.segment_footprints[segment_name];
+            total.reserved_bytes += footprint->reserved_bytes;
+            total.largest_free_region_bytes =
+                std::max(total.largest_free_region_bytes,
+                         footprint->largest_free_region_bytes);
+        }
     }
 }
 

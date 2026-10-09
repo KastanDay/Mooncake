@@ -393,6 +393,7 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 - `mooncake_tenant_quota_reject_total{tenant_id,reason}`
 - `mooncake_tenant_evict_bytes_total{tenant_id}`
 - `mooncake_tenant_quota_allocatable_capacity_bytes`
+- `mooncake_tenant_quota_packing_scale`
 - `mooncake_tenant_quota_requested_bytes_sum`
 - `mooncake_tenant_quota_effective_bytes_sum`
 

@@ -86,6 +86,23 @@ Each tenant quota snapshot returns:
 
 In HA mode, quota admin requests are served only by the active master service. Standby, candidate, or inactive services return HTTP 503. If strict multi-tenant mode is disabled, the quota admin API returns HTTP 409 with `UNAVAILABLE_IN_CURRENT_MODE`. Deleting a non-empty tenant returns HTTP 409 with `TENANT_NOT_EMPTY`.
 
+### Scale Quotas for Allocator Padding
+
+Quotas count the bytes objects request. The offset allocator rounds each allocation up to its size class, which can add up to 12.5% per object. So when requested quotas add up to more than the registered memory, the allocators fill before tenants reach their quotas.
+
+When that happens, a Put fails, and the master evicts a share of every tenant's objects regardless of quota.
+
+`--tenant_quota_packing_scale` (off by default) scales the capacity that quotas divide by the allocators' packing efficiency: requested bytes divided by the bytes the allocators have reserved. Quotas then add up to what fits, so a full tenant evicts its own objects instead.
+
+How the scale is updated:
+- The master samples the efficiency every 10 seconds once allocators have reserved at least half of the memory.
+- The scale follows a moving average of the samples, starting at 1.0. It is clamped to `[--tenant_quota_packing_scale_floor, 1.0]`; the floor defaults to `0.8`.
+- Quotas are recomputed only when the scale moves by at least 0.5%.
+
+The scale changes how quotas are divided, not how much memory can be used. A lower scale lowers every tenant's effective quota, and tenants above their new quota are trimmed as after a capacity drop. The applied scale is exported as `mooncake_tenant_quota_packing_scale`.
+
+The scale affects quotas only when requested quotas add up to more than the registered memory, as with share-style policies; smaller explicit quotas are unaffected until the scaled capacity falls below their sum.
+
 ## SGLang
 
 When Mooncake is used as the HiCache storage backend, set `tenant_id` in the

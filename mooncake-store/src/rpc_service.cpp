@@ -1560,6 +1560,10 @@ WrappedMasterService::GetTenantQuotaAllocatableCapacityBytes() {
     return master_service_.GetTenantQuotaAllocatableCapacityBytes();
 }
 
+double WrappedMasterService::GetTenantQuotaPackingScale() const {
+    return master_service_.GetTenantQuotaPackingScale();
+}
+
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllKeysForAdmin() {
     // Compatibility endpoint: /get_all_keys historically listed only the

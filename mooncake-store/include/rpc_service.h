@@ -203,6 +203,7 @@ class WrappedMasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const std::string& tenant_id);
     tl::expected<uint64_t, ErrorCode> GetTenantQuotaAllocatableCapacityBytes();
+    double GetTenantQuotaPackingScale() const;
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
 

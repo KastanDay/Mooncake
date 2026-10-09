@@ -198,6 +198,10 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         service.RebuildTenantQuotaUsageFromMetadata();
     }
 
+    StorageUsageSnapshot MemoryUsage(MasterService& service) {
+        return service.segment_manager_.GetMemoryUsageSnapshot();
+    }
+
     void ReplaceTenantQuotaPolicyStore(
         MasterService& service, std::unique_ptr<TenantQuotaPolicyStore> store) {
         service.tenant_quota_policy_store_ = std::move(store);
@@ -1214,6 +1218,78 @@ TEST_F(MasterServiceTenantQuotaTest,
                     .Remove("orphan-key", TenantId("tenant-b"),
                             /*force=*/true)
                     .has_value());
+}
+
+// Share mode: requested quotas far above capacity, as in production, so the
+// effective quotas divide whatever capacity the Master reports.
+TEST_F(MasterServiceTenantQuotaTest,
+       PackingScaleShrinksQuotaCapacityToWhatTheAllocatorsHold) {
+    constexpr size_t kSegmentSize = 64 * 1024 * 1024;
+    // Between two allocator size classes: padded to 2359296 bytes.
+    constexpr uint64_t kObjectSize = 2248704;
+    const TenantId tenant_a("tenant-a");
+    const TenantId tenant_b("tenant-b");
+    auto config = MakeConfig({{tenant_a, 9ULL << 50}, {tenant_b, 1ULL << 50}});
+    config.tenant_quota_packing_scale = true;
+    MasterService service(config);
+    UUID client_id = MountSegment(service, kSegmentSize);
+    const uint64_t quota_before =
+        Snapshot(service, tenant_a).effective_quota_bytes;
+    EXPECT_EQ(service.GetTenantQuotaAllocatableCapacityBytes(), kSegmentSize);
+
+    // 16 objects reserve about 56% of the segment: enough to sample.
+    for (int i = 0; i < 16; ++i) {
+        PutComplete(service, client_id, "packing-" + std::to_string(i),
+                    tenant_a, kObjectSize);
+    }
+    const auto usage = MemoryUsage(service);
+    ASSERT_GT(usage.footprint_bytes, usage.used_bytes);
+    const double efficiency = static_cast<double>(usage.used_bytes) /
+                              static_cast<double>(usage.footprint_bytes);
+
+    for (int i = 0; i < 200; ++i) {
+        service.RunTenantQuotaPackingUpdateForTesting();
+    }
+    const double scale = service.GetTenantQuotaPackingScale();
+    EXPECT_LT(scale, 1.0);
+    EXPECT_GE(scale, efficiency);
+    EXPECT_NEAR(scale, efficiency, 0.005);
+
+    const auto expected_capacity =
+        static_cast<uint64_t>(static_cast<long double>(kSegmentSize) *
+                              static_cast<long double>(scale));
+    EXPECT_EQ(service.GetTenantQuotaAllocatableCapacityBytes(),
+              expected_capacity);
+    const uint64_t quota_after =
+        Snapshot(service, tenant_a).effective_quota_bytes;
+    EXPECT_NEAR(static_cast<double>(quota_after),
+                static_cast<double>(quota_before) * scale, 2.0);
+}
+
+TEST_F(MasterServiceTenantQuotaTest, PackingScaleStaysAtOneWhenDisabled) {
+    constexpr size_t kSegmentSize = 64 * 1024 * 1024;
+    constexpr uint64_t kObjectSize = 2248704;
+    const TenantId tenant_a("tenant-a");
+    MasterService service(MakeConfig({{tenant_a, 1ULL << 50}}));
+    UUID client_id = MountSegment(service, kSegmentSize);
+    for (int i = 0; i < 16; ++i) {
+        PutComplete(service, client_id, "unscaled-" + std::to_string(i),
+                    tenant_a, kObjectSize);
+    }
+    for (int i = 0; i < 200; ++i) {
+        service.RunTenantQuotaPackingUpdateForTesting();
+    }
+    EXPECT_DOUBLE_EQ(service.GetTenantQuotaPackingScale(), 1.0);
+    EXPECT_EQ(service.GetTenantQuotaAllocatableCapacityBytes(), kSegmentSize);
+}
+
+TEST_F(MasterServiceTenantQuotaTest, PackingScaleRejectsInvalidFloor) {
+    auto config = MakeConfig({{TenantId("tenant-a"), 1000}});
+    config.tenant_quota_packing_scale = true;
+    config.tenant_quota_packing_scale_floor = 0.0;
+    EXPECT_THROW(MasterService service(config), std::invalid_argument);
+    config.tenant_quota_packing_scale_floor = 1.5;
+    EXPECT_THROW(MasterService service(config), std::invalid_argument);
 }
 
 }  // namespace mooncake::test

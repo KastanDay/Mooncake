@@ -125,6 +125,8 @@ if(USE_CUDA)
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
+add_store_test(tenant_quota_packing_scale_test
+               tenant_quota_packing_scale_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)

@@ -34,6 +34,20 @@ MasterMetricManager::MasterMetricManager()
       mem_total_capacity_per_segment_(
           "segment_total_capacity_bytes",
           "Total memory capacity of the mounted segment", {"segment"}),
+      mem_allocated_footprint_(
+          "master_allocated_footprint_bytes",
+          "Memory the allocators have set aside across all segments: "
+          "master_allocated_bytes plus the padding of each allocation up to "
+          "its allocator size class"),
+      mem_allocated_footprint_per_segment_(
+          "segment_allocated_footprint_bytes",
+          "Memory the segment's allocator has set aside, padding included",
+          {"segment"}),
+      mem_largest_free_region_per_segment_(
+          "segment_largest_free_region_bytes",
+          "Largest allocation the segment can still take, rounded down to its "
+          "allocator size class",
+          {"segment"}),
       nof_allocated_size_(
           "master_nof_allocated_bytes",
           "Total nof ssd bytes currently allocated across all segments"),
@@ -508,6 +522,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     // Update Gauges (use update(0) to mark as changed)
     mem_allocated_size_.update(0);
     mem_total_capacity_.update(0);
+    mem_allocated_footprint_.update(0);
     file_allocated_size_.update(0);
     file_total_capacity_.update(0);
     key_count_.update(0);
@@ -717,9 +732,27 @@ int64_t MasterMetricManager::get_segment_total_mem_capacity(
     return mem_total_capacity_per_segment_.value({segment});
 }
 
+int64_t MasterMetricManager::get_allocated_mem_footprint() {
+    return mem_allocated_footprint_.value();
+}
+
+int64_t MasterMetricManager::get_segment_allocated_mem_footprint(
+    const std::string& segment) {
+    return mem_allocated_footprint_per_segment_.value({segment});
+}
+
+int64_t MasterMetricManager::get_segment_largest_free_region(
+    const std::string& segment) {
+    return mem_largest_free_region_per_segment_.value({segment});
+}
+
 void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
     mem_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     mem_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
+    mem_allocated_footprint_per_segment_.remove_label_value(
+        {{"segment", segment}});
+    mem_largest_free_region_per_segment_.remove_label_value(
+        {{"segment", segment}});
 }
 
 // NoF segment Metrics
@@ -801,6 +834,28 @@ void MasterMetricManager::project_storage_usage(
     project_tier(snapshot.nof, nof_allocated_size_, nof_total_capacity_,
                  nof_allocated_size_per_segment_,
                  nof_total_capacity_per_segment_, projected_nof_segments_);
+
+    mem_allocated_footprint_.update(
+        static_cast<int64_t>(snapshot.memory.footprint_bytes));
+    std::set<std::string> footprint_segments;
+    for (const auto& [segment_name, footprint] :
+         snapshot.memory.segment_footprints) {
+        footprint_segments.insert(segment_name);
+        mem_allocated_footprint_per_segment_.update(
+            {segment_name}, static_cast<int64_t>(footprint.reserved_bytes));
+        mem_largest_free_region_per_segment_.update(
+            {segment_name},
+            static_cast<int64_t>(footprint.largest_free_region_bytes));
+    }
+    for (const auto& segment_name : projected_mem_footprint_segments_) {
+        if (!footprint_segments.contains(segment_name)) {
+            mem_allocated_footprint_per_segment_.remove_label_value(
+                {{"segment", segment_name}});
+            mem_largest_free_region_per_segment_.remove_label_value(
+                {{"segment", segment_name}});
+        }
+    }
+    projected_mem_footprint_segments_ = std::move(footprint_segments);
 }
 
 int64_t MasterMetricManager::get_segment_allocated_nof_size(
@@ -1850,6 +1905,9 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(mem_total_capacity_);
     serialize_metric(mem_allocated_size_per_segment_);
     serialize_metric(mem_total_capacity_per_segment_);
+    serialize_metric(mem_allocated_footprint_);
+    serialize_metric(mem_allocated_footprint_per_segment_);
+    serialize_metric(mem_largest_free_region_per_segment_);
     serialize_metric(nof_allocated_size_);
     serialize_metric(nof_total_capacity_);
     serialize_metric(nof_allocated_size_per_segment_);

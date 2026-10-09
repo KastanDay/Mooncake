@@ -418,6 +418,28 @@ size_t OffsetBufferAllocator::getLargestFreeRegion() const {
     }
 }
 
+std::optional<AllocatorFootprint> OffsetBufferAllocator::footprint() const {
+    if (!offset_allocator_) {
+        return std::nullopt;
+    }
+    try {
+        // One locked read, so the two values describe the same allocator
+        // state. An allocator out of nodes reports no free space, which is
+        // accurate: it cannot allocate.
+        const auto report = offset_allocator_->storageReport();
+        return AllocatorFootprint{
+            .reserved_bytes =
+                total_size_ -
+                std::min<size_t>(report.totalFreeSpace, total_size_),
+            .largest_free_region_bytes = report.largestFreeRegion,
+        };
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to get storage report: " << e.what()
+                   << " segment=" << segment_name_;
+        return std::nullopt;
+    }
+}
+
 std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,

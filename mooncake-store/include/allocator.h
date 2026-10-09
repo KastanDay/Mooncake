@@ -4,6 +4,7 @@
 #include <atomic>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -113,6 +114,19 @@ class AllocatedBuffer {
 };
 
 /**
+ * What an allocator has actually set aside, as opposed to the requested bytes
+ * that BufferAllocatorBase::size() counts.
+ */
+struct AllocatorFootprint {
+    // Bytes no longer free: live allocations, including any rounding up to the
+    // allocator's size classes.
+    size_t reserved_bytes{0};
+    // Largest free region, rounded down to its size class: an allocation of
+    // up to this many bytes can still succeed.
+    size_t largest_free_region_bytes{0};
+};
+
+/**
  * Virtual base class for buffer allocators.
  * Defines the interface that all buffer allocators must implement.
  */
@@ -137,6 +151,15 @@ class BufferAllocatorBase {
      * allocation may still fail due to race conditions or fragmentation.
      */
     virtual size_t getLargestFreeRegion() const = 0;
+
+    /**
+     * Returns the allocator's footprint, or nullopt if it does not track one.
+     * Observability only: nothing makes allocation or eviction decisions on
+     * it.
+     */
+    virtual std::optional<AllocatorFootprint> footprint() const {
+        return std::nullopt;
+    }
 
     /**
      * Attach this allocator to a domain usage tracker exactly once, before it
@@ -312,6 +335,12 @@ class OffsetBufferAllocator
      * Returns the actual largest free region from the offset allocator.
      */
     size_t getLargestFreeRegion() const override;
+
+    /**
+     * The offset allocator rounds every allocation up to its size bin, so
+     * reserved_bytes exceeds size() by that padding.
+     */
+    std::optional<AllocatorFootprint> footprint() const override;
 
     // Public method to get offset_allocator
     std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator()
