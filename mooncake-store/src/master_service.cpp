@@ -1521,14 +1521,17 @@ bool MasterService::MakeRoomForWrite(const TenantId& tenant_id,
         quota_trim_worker_.Schedule();
         return false;
     };
-    // Already far over (a capacity drop or a lowered quota): the trim is
-    // due, and an inline scan would only spend this RPC's IO thread before
-    // refusing anyway. Likewise right after this thread's budget ran out for
-    // the tenant (the rest of a batch, or its next write): the trim has it.
+    // Far over: holding more than twice its quota (a quota collapsed with
+    // capacity, or lowered). The trim is due, and an inline scan would only
+    // spend this RPC's IO thread before refusing anyway. Likewise right after
+    // an inline pass on this thread found nothing evictable for the tenant
+    // (the rest of a batch, or its next write).
     thread_local std::optional<TenantId> exhausted_tenant;
     thread_local std::chrono::steady_clock::time_point exhausted_at;
     const auto started = std::chrono::steady_clock::now();
-    if (overage > kInlineQuotaOverageBytes ||
+    const uint64_t far_over = std::max(
+        kInlineQuotaOverageBytes, tenant ? tenant->effective_quota_bytes : 0);
+    if (overage > far_over ||
         (exhausted_tenant == tenant_id &&
          started - exhausted_at < std::chrono::milliseconds(100))) {
         return refuse();
@@ -1547,8 +1550,12 @@ bool MasterService::MakeRoomForWrite(const TenantId& tenant_id,
                      << ", evicted_objects=" << result.evicted_objects
                      << ", elapsed_ms=" << elapsed_ms;
     }
-    if (result.freed_bytes >= deficit_bytes || !result.budget_exhausted) {
-        return true;  // Room made, or nothing more is evictable: as before.
+    // Room made, nothing more evictable (as before), or progress: the write's
+    // retry loop tries again, each pass bounded, so a busy tenant's writes
+    // keep up with 16 threads' worth of eviction rather than one trim's.
+    if (result.freed_bytes >= deficit_bytes || !result.budget_exhausted ||
+        result.freed_bytes > 0) {
+        return true;
     }
     exhausted_tenant = tenant_id;
     exhausted_at = std::chrono::steady_clock::now();
