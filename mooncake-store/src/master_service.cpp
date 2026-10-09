@@ -10222,7 +10222,12 @@ MasterService::EvictTenantMemoryForQuota(
     };
 
     size_t keys_examined = 0;
-    // Counts a key or bucket visit; the clock is read every 32 visits.
+    size_t buckets_visited = 0;
+    const size_t max_buckets =
+        max_keys_examined > std::numeric_limits<size_t>::max() / 16
+            ? std::numeric_limits<size_t>::max()
+            : max_keys_examined * 16;
+    // Counts a key visit; the clock is read every 32 visits.
     auto over_budget = [&] {
         if (++keys_examined > max_keys_examined ||
             ((keys_examined & 31) == 0 &&
@@ -10263,9 +10268,11 @@ MasterService::EvictTenantMemoryForQuota(
                      !total.budget_exhausted;
                      ++b) {
                     const size_t bucket = (first + b) % buckets;
-                    // An empty bucket costs a visit too (a map left sparse
-                    // by a spill, before BatchEvict shrinks it).
-                    if (over_budget()) {
+                    // Buckets have their own, larger cap: a map left sparse
+                    // by erasures keeps its high-water bucket count, and an
+                    // empty bucket is nearly free, but not unbounded.
+                    if (++buckets_visited > max_buckets) {
+                        total.budget_exhausted = true;
                         break;
                     }
                     keys.clear();
