@@ -316,6 +316,25 @@ MasterService::MasterService(const MasterServiceConfig& config)
                    << "current value: " << offload_cap_ratio_;
         throw std::invalid_argument("Invalid offload_cap_ratio");
     }
+    if (config.tenant_quota_packing_scale) {
+        if (!(config.tenant_quota_packing_scale_floor > 0.0 &&
+              config.tenant_quota_packing_scale_floor <= 1.0)) {
+            LOG(ERROR) << "tenant_quota_packing_scale_floor must be in "
+                          "(0.0, 1.0], current value: "
+                       << config.tenant_quota_packing_scale_floor;
+            throw std::invalid_argument(
+                "Invalid tenant_quota_packing_scale_floor");
+        }
+        if (!enable_multi_tenants_) {
+            LOG(WARNING) << "tenant_quota_packing_scale has no effect without "
+                            "enable_multi_tenants";
+        } else {
+            quota_packing_scale_.emplace(TenantQuotaPackingScale::Options{
+                .floor = config.tenant_quota_packing_scale_floor});
+            LOG(INFO) << "Tenant quota packing scale enabled, floor="
+                      << config.tenant_quota_packing_scale_floor;
+        }
+    }
     if (offloading_queue_limit_ == 0) {
         LOG(ERROR) << "offloading_queue_limit must be greater than 0";
         throw std::invalid_argument("Invalid offloading_queue_limit");
@@ -1474,7 +1493,37 @@ uint64_t MasterService::GetTenantQuotaAllocatableCapacityBytes() {
         }
         capacity += segment.size;
     }
+    // The scale is at most 1.0, so the product stays in range.
+    const double scale = GetTenantQuotaPackingScale();
+    if (scale < 1.0) {
+        capacity = static_cast<uint64_t>(static_cast<long double>(capacity) *
+                                         static_cast<long double>(scale));
+    }
     return capacity;
+}
+
+void MasterService::UpdateTenantQuotaPackingScale() {
+    if (!quota_packing_scale_) {
+        return;
+    }
+    const auto usage = segment_manager_.GetMemoryUsageSnapshot();
+    std::optional<double> scale;
+    double previous = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(quota_packing_scale_mutex_);
+        scale = quota_packing_scale_->Observe(
+            usage.used_bytes, usage.footprint_bytes, usage.capacity_bytes);
+        if (!scale) {
+            return;
+        }
+        previous = tenant_quota_packing_scale_.exchange(*scale);
+    }
+    LOG(INFO) << "action=tenant_quota_packing_scale previous=" << previous
+              << " scale=" << *scale << " requested_bytes=" << usage.used_bytes
+              << " reserved_bytes=" << usage.footprint_bytes
+              << " capacity_bytes=" << usage.capacity_bytes;
+    // A lower scale lowers every quota; the recompute schedules the trim.
+    RecomputeTenantEffectiveQuotas();
 }
 
 void MasterService::RecomputeTenantEffectiveQuotas() {
@@ -9362,6 +9411,8 @@ void MasterService::EvictionThreadFunc() {
 
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    auto next_quota_packing_update_time =
+        std::chrono::steady_clock::now() + kTenantQuotaPackingUpdateInterval;
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
@@ -9429,6 +9480,15 @@ void MasterService::EvictionThreadFunc() {
 
         if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
             RunPromotionCandidateRetry();
+        }
+
+        if (quota_packing_scale_) {
+            const auto steady_now = std::chrono::steady_clock::now();
+            if (steady_now >= next_quota_packing_update_time) {
+                UpdateTenantQuotaPackingScale();
+                next_quota_packing_update_time =
+                    steady_now + kTenantQuotaPackingUpdateInterval;
+            }
         }
 
         std::this_thread::sleep_for(

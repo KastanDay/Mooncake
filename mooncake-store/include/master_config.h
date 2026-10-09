@@ -128,6 +128,10 @@ struct MasterConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
+    // Scale tenant quota capacity by the allocators' packing efficiency
+    // (requested / reserved bytes); see TenantQuotaPackingScale.
+    bool tenant_quota_packing_scale = false;
+    double tenant_quota_packing_scale_floor = 0.8;
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY so the next Get is fast.
@@ -245,6 +249,8 @@ class MasterServiceSupervisorConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
+    bool tenant_quota_packing_scale = false;
+    double tenant_quota_packing_scale_floor = 0.8;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -305,6 +311,9 @@ class MasterServiceSupervisorConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
+        tenant_quota_packing_scale = config.tenant_quota_packing_scale;
+        tenant_quota_packing_scale_floor =
+            config.tenant_quota_packing_scale_floor;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -501,6 +510,8 @@ class WrappedMasterServiceConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
+    bool tenant_quota_packing_scale = false;
+    double tenant_quota_packing_scale_floor = 0.8;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -595,6 +606,9 @@ class WrappedMasterServiceConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
+        tenant_quota_packing_scale = config.tenant_quota_packing_scale;
+        tenant_quota_packing_scale_floor =
+            config.tenant_quota_packing_scale_floor;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -719,6 +733,9 @@ class WrappedMasterServiceConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
+        tenant_quota_packing_scale = config.tenant_quota_packing_scale;
+        tenant_quota_packing_scale_floor =
+            config.tenant_quota_packing_scale_floor;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -1178,6 +1195,8 @@ class MasterServiceConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
+    bool tenant_quota_packing_scale = false;
+    double tenant_quota_packing_scale_floor = 0.8;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -1268,6 +1287,9 @@ class MasterServiceConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
+        tenant_quota_packing_scale = config.tenant_quota_packing_scale;
+        tenant_quota_packing_scale_floor =
+            config.tenant_quota_packing_scale_floor;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;

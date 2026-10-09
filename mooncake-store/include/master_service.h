@@ -36,6 +36,7 @@
 #include "segment.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
+#include "tenant_quota_packing_scale.h"
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
@@ -202,6 +203,16 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+    // The scale applied to tenant quota capacity; 1.0 unless
+    // tenant_quota_packing_scale is on.
+    double GetTenantQuotaPackingScale() const {
+        return tenant_quota_packing_scale_.load(std::memory_order_relaxed);
+    }
+    // One packing-scale sample, as the eviction thread takes every
+    // kTenantQuotaPackingUpdateInterval.
+    void RunTenantQuotaPackingUpdateForTesting() {
+        UpdateTenantQuotaPackingScale();
+    }
 
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
@@ -1987,6 +1998,9 @@ class MasterService {
         uint64_t* deficit_bytes = nullptr);
     void ReleaseTenantQuota(TenantQuotaHandle account, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
+    // Samples the memory tier's packing efficiency and, when the scale moves,
+    // recomputes tenant quotas with it. Called without other locks held.
+    void UpdateTenantQuotaPackingScale();
     void RebuildTenantQuotaUsageFromMetadata();
     void LoadTenantQuotaPoliciesFromStoreOrThrow();
     void ApplyTenantQuotaPolicies(const TenantQuotaPolicySnapshot& snapshot);
@@ -2212,6 +2226,17 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+
+    // Tenant quota packing scale (config: tenant_quota_packing_scale). Set
+    // only with multi-tenancy. UpdateTenantQuotaPackingScale publishes each
+    // applied scale to tenant_quota_packing_scale_, which
+    // GetTenantQuotaAllocatableCapacityBytes reads. quota_packing_scale_mutex_
+    // is a leaf, held only around one Observe call.
+    std::optional<TenantQuotaPackingScale> quota_packing_scale_;
+    std::mutex quota_packing_scale_mutex_;
+    std::atomic<double> tenant_quota_packing_scale_{1.0};
+    static constexpr auto kTenantQuotaPackingUpdateInterval =
+        std::chrono::seconds(10);
 
     // Snapshot manager handles snapshot lifecycle orchestration
     std::unique_ptr<MasterSnapshotManager> snapshot_manager_;
