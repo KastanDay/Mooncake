@@ -6,6 +6,82 @@ python.cfdata.org. Newest first. Each entry is a GitLab release tagged
 `wheel-<version>` on the wheels' source commit; the version is the build's UTC
 start time, `YY.MDD.HMMSS`.
 
+## wheel-v0.3.13.post1+26.1009.155842 (2026-10-09)
+
+Master: the liveness fix plus churn metrics, batch-put co-location and allocator footprint metrics.
+
+This is wheel-v0.3.13.post1+26.1009.65649 (the Master liveness fix, A/B-tested on eu-west1 with 0 collateral expiries in 35 scenarios) with three more Master-only changes merged in:
+
+- **kastan/Mooncake!3**, Store churn's cost to the KV cache, and batch-put co-location (phases P0 and A of `docs/source/design/store/hot-replica-churn.md`):
+  - `--enable_kv_churn_metrics` (off by default) adds per-object read heat, which objects churn drops and why (unmount, client expiry, disk unmount, evictions), misses on them later, and prefix breaks in `BatchExistKey`. About 48 MB of Master memory.
+  - `--colocate_batch_puts` (off by default) places a batch put in its first object's 64-GiB chunk, then a sibling chunk, then `free_ratio_first`. One elastic shrink then breaks about 2% of prefixes instead of about 59%.
+- **kastan/Mooncake!1**, the allocators' footprint: `master_allocated_footprint_bytes`, and per segment the footprint and largest free region. Together they show the padding and fragmentation that `master_allocated_bytes` misses: eu-west1 tops out near 87% allocated, and pool-wide 5% evictions follow.
+- **kastan/Mooncake!2**, `--tenant_quota_packing_scale` (off by default): scales the capacity tenant quotas divide by the allocators' packing efficiency, smoothed and bounded below by `--tenant_quota_packing_scale_floor` (0.8).
+
+All new behaviour is behind flags that are off by default. There is no client or protocol change.
+
+Tests, on the merge:
+- The Master suites pass, including HA and snapshot, the client and server suites, `kv_churn_test` (12), `tenant_quota_packing_scale_test` (4), `buffer_allocator_test` (20) and `master_liveness_isolation_test` (28).
+- Two tests fail the same way without these changes:
+  - one HA test needs etcd;
+  - `MasterServiceSSDSnapshotTest.EvictObject` is flaky upstream. It failed 3 of 10 runs alone on the pre-liveness base, and 2 of 10 on 65649.
+- The built `mooncake_master` starts with `--enable_kv_churn_metrics=true --colocate_batch_puts=true`, the flags mooncake-helm !111 passes.
+
+### Artifacts
+
+Version `0.3.13.post1+26.1009.155842` (built 2026-10-09 15:58:42 UTC) from `6ec05f69a0f3ccd427227b274dd0f4253ec5a000` on `kastan/wheel`.
+Builder images: non-cuda: `pytorch/manylinux2_28-builder:cuda12.8`. CPython 3.12, x86_64.
+
+| Variant | File | sha256 | Registry |
+|---|---|---|---|
+| non-cuda | `mooncake_transfer_engine_non_cuda-0.3.13.post1+26.1009.155842-cp312-cp312-manylinux_2_28_x86_64.whl` | `a77cfe05618bebc730f6b2a6d62a53f294e7b6bb0cbb6663e317781432a66c49` | [https://python.cfdata.org/project/mooncake-transfer-engine-non-cuda/files/…](https://python.cfdata.org/project/mooncake-transfer-engine-non-cuda/files/mooncake_transfer_engine_non_cuda-0.3.13.post1+26.1009.155842-cp312-cp312-manylinux_2_28_x86_64.whl) |
+
+Pin (mooncake-helm `mooncake-shared-cache` values; pods get `PYTHON_REGISTRY` from
+the `cf-python-registry` Secret):
+
+```yaml
+  master.package: "${PYTHON_REGISTRY}/project/mooncake-transfer-engine-non-cuda/files/mooncake_transfer_engine_non_cuda-0.3.13.post1+26.1009.155842-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=a77cfe05618bebc730f6b2a6d62a53f294e7b6bb0cbb6663e317781432a66c49"
+```
+
+### Commits since v0.3.13.post1
+
+- `431e70ef` [Store] Unregister a segment's memory when its mount fails (Kastan Day)
+- `57d1b314` Add additive successful-read source receipts to Store clients (Kastan Day)
+- `598eeac7` Distinguish observed replica eviction from surviving servable metadata (Kastan Day)
+- `1f4ce545` Record wheel-26.1006.215531 in the changelog (Kastan Day)
+- `5c120b67` [Store] Keep Master client liveness independent of metadata cleanup (Kastan Day)
+- `28edeb72` [Store] Close the gaps an implementation review found (Kastan Day)
+- `7d7cd076` [Store] Fence promotion enqueue and expiry's deadline cleanup (Kastan Day)
+- `ad44146a` Record wheel-26.1008.43949 in the changelog (Kastan Day)
+- `294ed5a4` [Store] Make disk-replica validity monotone; one record of client status (Kastan Day)
+- `8f86e3ea` [Store] Rebind only a completed disk replica on re-adoption (Kastan Day)
+- `5644d1f9` Record wheel-26.1008.65205 in the changelog (Kastan Day)
+- `7a5f072e` [Store] Bound inline quota eviction; no eviction pass holds the snapshot lock (Kastan Day)
+- `d208dfb3` Record wheel-26.1008.202747 in the changelog (Kastan Day)
+- `1e3e5fe1` [Store] Walk quota eviction from a random bucket; quiet routine trims (Kastan Day)
+- `317da539` [Store] Format the quota eviction walk (Kastan Day)
+- `1fc4dd95` Record wheel-26.1008.211229 in the changelog (Kastan Day)
+- `fe3310b8` [Store] Refuse writes to far-over tenants without scanning; quieter evictions (Kastan Day)
+- `b29e8e9c` [Store] Trim only what refused writes add; bound batches; no empty-census loop (Kastan Day)
+- `947d58f7` [Store] Bound inline quota eviction by time as well as keys (Kastan Day)
+- `90a89aca` [Store] Sum refused writes' demand for the quota trim (Kastan Day)
+- `fdbac9a7` [Store] Log slow RPCs and slow exclusive snapshot waits and holds (Kastan Day)
+- `d97c307e` [Store] Keep busy tenants' writes inline; refuse only collapsed quotas (Kastan Day)
+- `858be0a8` [Store] Cap the quota eviction's bucket visits separately from its keys (Kastan Day)
+- `647c8193` [Store] Export the allocators' footprint and largest free region (Kastan Day)
+- `2b3744bc` [Store] Count queued offloads as quota-eviction progress (Kastan Day)
+- `0cc0eae9` [Store] Scale tenant quota capacity by allocator packing, behind a flag (Kastan Day)
+- `d2730429` [Store] Keep the inline quota eviction to its deadline between shards (Kastan Day)
+- `205af36e` [Store] Format the last two quota-eviction changes (Kastan Day)
+- `f1c14eb5` [Store] Serve the Stores' batch RPCs off the RPC IO threads (Kastan Day)
+- `41d40227` [Store] Order the Stores' batch RPCs per connection, not per client (Kastan Day)
+- `a544e76e` Record wheel-v0.3.13.post1+26.1009.65649 in the changelog (Kastan Day)
+- `1c3f9734` [Store] Measure what Store churn costs the KV cache (Kastan Day)
+- `dbd268dd` [Store] Co-locate a batch put in its first object's chunk (Kastan Day)
+- `e9bbe868` [Doc] Design for keeping KV hit rates through Store churn (Kastan Day)
+- `10b303ef` Merge kastan/hot-replica-churn (kastan/Mooncake!3) into the wheel branch (Kastan Day)
+- `6ec05f69` Merge kastan/quota-packing-scale (kastan/Mooncake!1, !2) into the wheel branch (Kastan Day)
+
 ## wheel-v0.3.13.post1+26.1009.65649 (2026-10-09)
 
 Master: keep client liveness independent of metadata cleanup.
