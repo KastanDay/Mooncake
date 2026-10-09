@@ -199,7 +199,7 @@ DEFINE_uint32(churn_miss_window_seconds, 3600,
               "miss on it is counted as a churn miss");
 DEFINE_uint64(churn_miss_slice_capacity, 1 << 20,
               "Dropped objects remembered per sixth of the churn-miss window "
-              "(8 bytes each)");
+              "(8 bytes each; at most 2^26)");
 DEFINE_bool(colocate_batch_puts, false,
             "Place each object of a batch put on the memory segment the "
             "previous object of the batch went to, when it has room");

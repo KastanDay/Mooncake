@@ -91,7 +91,8 @@ ChurnMissFilter::ChurnMissFilter(std::chrono::seconds window,
                                  size_t slice_capacity)
     : slice_length_(std::max<std::chrono::seconds::rep>(
           1, window.count() / static_cast<int64_t>(kSlices))),
-      slice_capacity_(std::max<size_t>(1, slice_capacity)),
+      // At most 2^26 drops (512 MiB) per slice: a larger value is a typo.
+      slice_capacity_(std::clamp<size_t>(slice_capacity, 1, size_t{1} << 26)),
       // At most half full, so probe sequences stay short.
       mask_(NextPowerOfTwo(2 * slice_capacity_) - 1),
       slices_(kSlices) {
@@ -293,8 +294,12 @@ KvChurnMetrics::KvChurnMetrics()
       batch_span_("master_kv_batch_segments_spanned",
                   "Distinct memory segments (chunk) or Stores (store) holding "
                   "one batch's objects",
-                  {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64}, {"op", "level"}) {
-}
+                  {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64}, {"op", "level"}),
+      store_read_bytes_("master_kv_store_read_bytes_total",
+                        "Object bytes of served reads whose memory replica is "
+                        "on this Store (segment name); its label is dropped "
+                        "when the Store unmounts a segment",
+                        {"segment"}) {}
 
 void KvChurnMetrics::ObserveRead(uint32_t heat_before, uint32_t heat_after,
                                  uint64_t size) {
@@ -350,6 +355,15 @@ void KvChurnMetrics::ObserveBatchSpan(const char* op, size_t chunks,
     batch_span_.observe({op, "store"}, static_cast<int64_t>(stores));
 }
 
+void KvChurnMetrics::ObserveStoreRead(const std::string& store,
+                                      uint64_t bytes) {
+    store_read_bytes_.inc({store}, static_cast<int64_t>(bytes));
+}
+
+void KvChurnMetrics::RemoveStore(const std::string& store) {
+    store_read_bytes_.remove_label_value({{"segment", store}});
+}
+
 std::string KvChurnMetrics::Serialize() {
     std::string out;
     read_heat_.serialize(out);
@@ -366,6 +380,7 @@ std::string KvChurnMetrics::Serialize() {
     batch_exist_stranded_keys_.serialize(out);
     batch_exist_first_miss_.serialize(out);
     batch_span_.serialize(out);
+    store_read_bytes_.serialize(out);
     return out;
 }
 

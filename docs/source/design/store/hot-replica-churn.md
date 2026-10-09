@@ -443,9 +443,39 @@ lands, replacing that job's planner with this walk.
 | `master_kv_batch_exist_first_miss_total` | `cause` (or `none`) | Prefix breaks, by what broke them |
 | `master_kv_churn_filter_overflow_total` | | Drops not remembered (slice full) |
 | `master_kv_batch_segments_spanned` | `op` (put, get), `level` (chunk, store) | Placement spread per batch |
+| `master_kv_store_read_bytes_total` | `segment` (a Store) | Read load per Store: what A concentrates (3.4, "Cost") |
 
 Exit criteria read straight off these: churn misses over lookup misses, the
 `first_miss` share by cause, and stranded over usable keys.
+
+Reading them correctly:
+
+- **Misses are counted per lookup, not per key.** A lost hot key counts on
+  every request until it is rewritten, and every key after the first miss of a
+  never-cached prefix is a `none` miss, so `churn_misses / lookup_misses`
+  understates churn's cost in tokens. `first_miss` by cause and `stranded /
+  (usable + stranded)` are the measures of prefix damage.
+- **The batch-exist counters assume one prefix-ordered key list per call.**
+  That holds for SGLang's `batch_exists`. Hybrid models
+  (`batch_exists_v2` with pool transfers: Mamba, SWA, draft pools) make a
+  second call over concatenated sidecar keys in which holes are expected,
+  which inflates `stranded` and `first_miss{cause="none"}`. The Master cannot
+  tell the two calls apart, so read these per model.
+- **The `put` span is per batch, not per prefix.** Under A it reads about 1
+  while a ~200-key prefix still spans its ~4 batches' chunks, and it counts
+  only newly allocated objects. `get` spans are per SGLang prefetch batch.
+  Stranded keys show A's effect on prefixes.
+- **Heat is halved at a global epoch boundary**, so an object read at a steady
+  `r` per half-life sits between `r` and `2r`, and one with `r` in
+  `[t/2, t)` re-crosses threshold `t` every half-life: the crossing rate
+  overstates what a B with hysteresis would admit. A rewritten object starts
+  cold again (new metadata).
+- **The filter is a floor during mass loss.** Each slice holds
+  `--churn_miss_slice_capacity` drops (1M); a whole-cluster flush overflows it,
+  and `master_kv_churn_filter_overflow_total` counts the rest. A Master restart
+  forgets it. Drops can also be slight overcounts: an object whose only
+  remaining replica is an in-flight offload counts when its memory copy is
+  lost, even if the offload later completes.
 
 ### P1: A plus B
 

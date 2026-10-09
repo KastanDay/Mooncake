@@ -176,6 +176,12 @@ class KvChurnMetrics {
                            const std::optional<ChurnMiss>* first_miss);
     // Distinct memory segments (chunks) and Stores a batch's objects are on.
     void ObserveBatchSpan(const char* op, size_t chunks, size_t stores);
+    // Bytes of served reads whose memory replica is on `store` (a segment
+    // name): the read load co-location concentrates.
+    void ObserveStoreRead(const std::string& store, uint64_t bytes);
+    // Drops the Store's label when its segment is unmounted, as the other
+    // per-segment metrics do.
+    void RemoveStore(const std::string& store);
 
     std::string Serialize();
 
@@ -196,6 +202,7 @@ class KvChurnMetrics {
     ylt::metric::counter_t batch_exist_stranded_keys_;
     ylt::metric::dynamic_counter_1t batch_exist_first_miss_;
     ylt::metric::dynamic_histogram_2t batch_span_;
+    ylt::metric::dynamic_counter_1t store_read_bytes_;
 };
 
 }  // namespace mooncake

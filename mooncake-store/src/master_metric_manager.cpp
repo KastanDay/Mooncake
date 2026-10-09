@@ -753,6 +753,7 @@ void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
         {{"segment", segment}});
     mem_largest_free_region_per_segment_.remove_label_value(
         {{"segment", segment}});
+    KvChurnMetrics::instance().RemoveStore(segment);
 }
 
 // NoF segment Metrics

@@ -4175,12 +4175,17 @@ auto MasterService::GetReplicaList(const std::string& key,
         const auto& metadata = accessor.Get();
 
         std::vector<Replica::Descriptor> replica_list;
+        const Replica* first_memory_replica = nullptr;
         metadata.VisitReplicas(
             [this](const Replica& replica) {
                 return IsReplicaReadable(replica);
             },
-            [this, &key, &replica_list](const Replica& replica) {
+            [this, &key, &replica_list,
+             &first_memory_replica](const Replica& replica) {
                 replica_list.emplace_back(replica.get_descriptor());
+                if (!first_memory_replica && replica.is_memory_replica()) {
+                    first_memory_replica = &replica;
+                }
                 if (replica.is_dfs_replica() && dfs_allocator_) {
                     const auto& desc = replica.get_dfs_descriptor();
                     dfs_allocator_->UpdateAccess(key, desc.shard_idx,
@@ -4204,6 +4209,14 @@ auto MasterService::GetReplicaList(const std::string& key,
         }
         if (KvChurnMetricsEnabled()) {
             RecordKvRead(metadata, HeatEpochNow());
+            const auto allocator =
+                first_memory_replica
+                    ? first_memory_replica->memory_allocator()->lock()
+                    : nullptr;
+            if (allocator) {
+                KvChurnMetrics::instance().ObserveStoreRead(
+                    allocator->getSegmentName(), metadata.size);
+            }
         }
 
         // TODO: NoF SSD support (ranhaojia)
@@ -4342,6 +4355,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     std::vector<size_t> explain_later;
     std::vector<const void*> span_chunks;
     std::vector<std::string> span_stores;
+    std::vector<uint64_t> span_store_bytes;  // parallel to span_stores
 
     const size_t start_shard = randomIndex(kNumShards);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
@@ -4424,9 +4438,14 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                             span_chunks.push_back(chunk);
                         }
                         std::string store = allocator->getSegmentName();
-                        if (std::find(span_stores.begin(), span_stores.end(),
-                                      store) == span_stores.end()) {
+                        const auto store_it = std::find(
+                            span_stores.begin(), span_stores.end(), store);
+                        if (store_it == span_stores.end()) {
                             span_stores.push_back(std::move(store));
+                            span_store_bytes.push_back(metadata.size);
+                        } else {
+                            span_store_bytes[store_it - span_stores.begin()] +=
+                                metadata.size;
                         }
                     }
                 }
@@ -4516,6 +4535,10 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         if (!span_chunks.empty()) {
             KvChurnMetrics::instance().ObserveBatchSpan(
                 "get", span_chunks.size(), span_stores.size());
+        }
+        for (size_t i = 0; i < span_stores.size(); ++i) {
+            KvChurnMetrics::instance().ObserveStoreRead(span_stores[i],
+                                                        span_store_bytes[i]);
         }
     }
     return results;
@@ -5060,11 +5083,21 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     if (!persist_result) {
                         return tl::make_unexpected(persist_result.error());
                     }
+                    // Churn metrics: a rewrite of a lost object (the hottest
+                    // ones come back first) can reclaim it before the
+                    // cleanup pass does.
+                    const auto churn_cause = KvChurnMetricsEnabled()
+                                                 ? ChurnLossCause(it->second)
+                                                 : std::nullopt;
                     if (enable_oplog_) {
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     } else if (CleanupStaleHandles(tenant_state, it->second,
                                                    &shard)) {
+                        if (churn_cause) {
+                            RecordChurnDrop(object_id.tenant_id, key,
+                                            *churn_cause, it->second);
+                        }
                         EraseMetadata(tenant_state, it, object_id.tenant_id,
                                       QuotaEraseMode::kFull, &shard);
                         it = tenant_state.metadata.end();
@@ -5752,11 +5785,21 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     if (!persist_result) {
                         return tl::make_unexpected(persist_result.error());
                     }
+                    // Churn metrics: a rewrite of a lost object (the hottest
+                    // ones come back first) can reclaim it before the
+                    // cleanup pass does.
+                    const auto churn_cause = KvChurnMetricsEnabled()
+                                                 ? ChurnLossCause(it->second)
+                                                 : std::nullopt;
                     if (enable_oplog_) {
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     } else if (CleanupStaleHandles(tenant_state, it->second,
                                                    &shard)) {
+                        if (churn_cause) {
+                            RecordChurnDrop(object_id.tenant_id, key,
+                                            *churn_cause, it->second);
+                        }
                         // EraseMetadata handles processing_keys,
                         // replication_tasks, offloading_tasks (with
                         // dec_refcnt), and promotion task cleanup.
