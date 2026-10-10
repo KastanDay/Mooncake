@@ -478,6 +478,30 @@ class MasterLivenessIsolationTest : public ::testing::Test {
         }
         return pred();
     }
+
+    // The monitor's policy, driven on a synthetic clock: the monitor thread
+    // is stopped first so it neither expires nor resets anything meanwhile.
+    static void StopClientMonitor(MasterService& service) {
+        service.client_monitor_running_ = false;
+        if (service.client_monitor_thread_.joinable()) {
+            service.client_monitor_thread_.join();
+        }
+    }
+    static void ObserveAt(MasterService& service, const UUID& id,
+                          Clock::time_point at) {
+        service.ObserveClientAt(id, at);
+    }
+    static std::vector<UUID> SelectAt(MasterService& service,
+                                      Clock::time_point at) {
+        return service.SelectClientsToExpire(at);
+    }
+    static size_t Routes(MasterService& service) {
+        return service.group_routing_.RouteCount();
+    }
+    static std::optional<std::string> GroupRoute(MasterService& service,
+                                                 const std::string& key) {
+        return service.GetGroupRoute(TenantId::Default(), key);
+    }
 };
 
 // The convoy itself: a metadata pass holds snapshot_mutex_ shared, a remount
@@ -1378,6 +1402,358 @@ TEST_F(MasterLivenessIsolationTest, LatencyStaysFlatWhileManyKeysAreReclaimed) {
     EXPECT_LT(unmount.count(), 1000);
     EXPECT_LT(worst_ping.count(), 500);
     EXPECT_LT(worst_remount.count(), 2000);
+}
+
+// ---------------------------------------------------------------------------
+// eu-west1, 2026-10-10 01:34 UTC. SGLang's enable_group_semantics gives every
+// KV object a group route. The insert that took the one global route map past
+// 24,607,243 entries rehashed it, under its exclusive lock, for 10.3 s. Every
+// metadata lookup (getMetadataShardIndex) waited behind it; all 16 RPC IO
+// threads blocked in data RPCs; no Ping was answered; and the monitor expired
+// all 47 clients at the 10-s TTL, flushing the cache. The tests below pin
+// both halves: no route insert costs more than one stripe's rehash, and the
+// Master's own silence never expires every client.
+
+namespace {
+std::string RouteKey(size_t i) {
+    return "gemma-4-26b\x1fproduction.gemma-4-26b-1-2_" +
+           std::to_string(i * 2654435761ULL) +
+           "a3f1c0de9b7e4d2a8c6f0e1b3d5a7c9e_0_swa_k";
+}
+}  // namespace
+
+// With one map, the insert past 2,938,679 routes rehashed all of them: about
+// 0.5 s on a laptop, 10 s at production's 24.6M. Striped, a rehash moves
+// about 1/1024 of the routes.
+TEST_F(MasterLivenessIsolationTest, RouteInsertNeverRehashesAllRoutes) {
+    GroupRoutingIndex index;
+    constexpr size_t kRoutes = 3'000'000;
+    auto worst = Clock::duration::zero();
+    for (size_t i = 0; i < kRoutes; ++i) {
+        const std::string key = RouteKey(i);
+        const std::string group = "group_" + std::to_string(i / 4);
+        const auto start = Clock::now();
+        index.SetRoute(key, group);
+        worst = std::max(worst, Clock::now() - start);
+    }
+    EXPECT_EQ(index.RouteCount(), kRoutes);
+    // Spread evenly: no stripe holds twice its share.
+    EXPECT_LT(index.LargestStripeRouteCount(),
+              2 * kRoutes / GroupRoutingIndex::kStripes);
+    const auto worst_ms = std::chrono::duration_cast<milliseconds>(worst);
+    LOG(INFO) << "routes=" << kRoutes
+              << " worst_insert_ms=" << worst_ms.count();
+    EXPECT_LT(worst_ms.count(), 200);
+}
+
+// While one stripe is held, as its rehash holds it, lookups in the other
+// stripes are answered at once; only the held stripe's wait.
+TEST_F(MasterLivenessIsolationTest, RouteLookupsDoNotWaitOnAnotherStripe) {
+    GroupRoutingIndex index;
+    const std::string held = RouteKey(1);
+    std::string other;
+    for (size_t i = 2; other.empty(); ++i) {
+        if (GroupRoutingIndex::StripeIndexForTesting(RouteKey(i)) !=
+            GroupRoutingIndex::StripeIndexForTesting(held)) {
+            other = RouteKey(i);
+        }
+    }
+    index.SetRoute(held, "held_group");
+    index.SetRoute(other, "other_group");
+    auto lock = index.LockStripeForTesting(held);
+    auto other_lookup =
+        std::async(std::launch::async, [&] { return index.FindRoute(other); });
+    ASSERT_EQ(other_lookup.wait_for(milliseconds(1000)),
+              std::future_status::ready)
+        << "a lookup waited on another stripe's rehash";
+    EXPECT_EQ(other_lookup.get(), std::optional<std::string>("other_group"));
+    auto held_lookup =
+        std::async(std::launch::async, [&] { return index.FindRoute(held); });
+    EXPECT_EQ(held_lookup.wait_for(milliseconds(100)),
+              std::future_status::timeout);
+    lock.unlock();
+    EXPECT_EQ(held_lookup.get(), std::optional<std::string>("held_group"));
+}
+
+// Grouped objects still go to their group's shard, are found by every read
+// path, and lose their route when removed.
+TEST_F(MasterLivenessIsolationTest, GroupedObjectsAreRoutedThroughTheIndex) {
+    auto service = MakeService();
+    auto a = MountMemoryClient(*service, "group_a", 0x100000000, 1ULL << 30);
+    const std::vector<std::pair<std::string, std::string>> objects = {
+        {"page0_k", "page0"}, {"page0_v", "page0"}, {"page1_k", "page1"}};
+    for (const auto& [key, group] : objects) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.group_ids = std::vector<std::string>{group};
+        ASSERT_TRUE(
+            service->PutStart(a.id, key, TenantId::Default(), 1024, config)
+                .has_value());
+        ASSERT_TRUE(
+            service->PutEnd(a.id, key, TenantId::Default(), ReplicaType::MEMORY)
+                .has_value());
+    }
+    EXPECT_EQ(Routes(*service), 3u);
+    EXPECT_EQ(ShardOf(*service, "page0_k"), ShardOf(*service, "page0_v"));
+    EXPECT_EQ(GroupRoute(*service, "page1_k"),
+              std::optional<std::string>("page1"));
+    std::vector<std::string> keys;
+    for (const auto& [key, group] : objects) {
+        keys.push_back(key);
+        EXPECT_TRUE(service->ExistKey(key, TenantId::Default()).value_or(false))
+            << key;
+    }
+    for (const auto& found :
+         service->BatchExistKey(keys, TenantId::Default())) {
+        EXPECT_TRUE(found.value_or(false));
+    }
+    for (const auto& replicas :
+         service->BatchGetReplicaList(keys, TenantId::Default())) {
+        EXPECT_TRUE(replicas.has_value());
+    }
+    ASSERT_TRUE(service->Remove("page0_k", TenantId::Default(), /*force=*/true)
+                    .has_value());
+    EXPECT_EQ(Routes(*service), 2u);
+    EXPECT_FALSE(GroupRoute(*service, "page0_k").has_value());
+}
+
+namespace {
+std::vector<UUID> NewClients(size_t n) {
+    std::vector<UUID> ids;
+    for (size_t i = 0; i < n; ++i) {
+        ids.push_back(generate_uuid());
+    }
+    return ids;
+}
+}  // namespace
+
+// The policy on a synthetic clock, at production's TTL (10 s, clients ping
+// every second). The incident: all 47 clients last seen ~1 s apart, then no
+// Ping answered for 10.3 s.
+TEST_F(MasterLivenessIsolationTest, MasterStallIsNotCountedAgainstClients) {
+    auto service = MakeService(/*ttl_sec=*/10);
+    StopClientMonitor(*service);
+    const auto t0 = Clock::now() + std::chrono::hours(1);
+    auto at = [&](double s) {
+        return t0 + std::chrono::duration_cast<Clock::duration>(
+                        std::chrono::duration<double>(s));
+    };
+    const auto clients = NewClients(47);
+    for (int s = 0; s <= 2; ++s) {
+        for (const auto& id : clients) ObserveAt(*service, id, at(s));
+    }
+    // 10.2 s with nothing answered: before, every client was due here.
+    EXPECT_TRUE(SelectAt(*service, at(12.2)).empty());
+    // The stall ends; the queued Pings are answered, except one client's: it
+    // died during the stall.
+    const UUID died = clients.back();
+    auto observe_survivors = [&](double s) {
+        for (const auto& id : clients) {
+            if (id != died) ObserveAt(*service, id, at(s));
+        }
+    };
+    for (int s = 0; s <= 9; ++s) {
+        observe_survivors(12.4 + s);
+        EXPECT_TRUE(SelectAt(*service, at(12.5 + s)).empty()) << s;
+    }
+    // Its silence, less the stall (10.4 s), reaches the TTL at 22.4 s.
+    observe_survivors(21.9);
+    EXPECT_TRUE(SelectAt(*service, at(22.3)).empty());
+    observe_survivors(22.5);
+    EXPECT_EQ(SelectAt(*service, at(22.6)), std::vector<UUID>{died});
+}
+
+// Some RPC threads stalled while others answered: many clients due at once
+// are held for one more TTL; those that ping meanwhile stay, and those still
+// silent after it are expired.
+TEST_F(MasterLivenessIsolationTest, ManyClientsDueAtOnceAreHeldOneTtl) {
+    auto service = MakeService(/*ttl_sec=*/10);
+    StopClientMonitor(*service);
+    const auto t0 = Clock::now() + std::chrono::hours(1);
+    auto at = [&](double s) {
+        return t0 + std::chrono::duration_cast<Clock::duration>(
+                        std::chrono::duration<double>(s));
+    };
+    const auto clients = NewClients(40);
+    const std::vector<UUID> stuck(clients.begin(), clients.begin() + 10);
+    auto is_stuck = [&](const UUID& id) {
+        return std::find(stuck.begin(), stuck.end(), id) != stuck.end();
+    };
+    for (int s = 0; s <= 2; ++s) {
+        for (const auto& id : clients) ObserveAt(*service, id, at(s));
+    }
+    for (int s = 3; s <= 15; ++s) {
+        for (const auto& id : clients) {
+            if (!is_stuck(id)) ObserveAt(*service, id, at(s));
+        }
+        // Due from 12 s, held: nothing is expired.
+        EXPECT_TRUE(SelectAt(*service, at(s + 0.5)).empty()) << s;
+    }
+    // Their Pings get through: they stay.
+    for (const auto& id : stuck) ObserveAt(*service, id, at(15.8));
+    EXPECT_TRUE(SelectAt(*service, at(16)).empty());
+    // Now they are gone for good: due at 25.8 s, held one TTL, then expired.
+    std::vector<UUID> expired;
+    for (int s = 16; s <= 40 && expired.empty(); ++s) {
+        for (const auto& id : clients) {
+            if (!is_stuck(id)) ObserveAt(*service, id, at(s));
+        }
+        expired = SelectAt(*service, at(s + 0.5));
+        if (!expired.empty()) {
+            EXPECT_GE(s + 0.5, 35.8);
+        }
+    }
+    std::sort(expired.begin(), expired.end());
+    auto expected = stuck;
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(expired, expected);
+}
+
+// The steady state is unchanged: one silent client (a Store rolled or
+// crashed) expires at its TTL, and so do the clients of a small Master.
+TEST_F(MasterLivenessIsolationTest, OneSilentClientStillExpiresAtTtl) {
+    auto service = MakeService(/*ttl_sec=*/10);
+    StopClientMonitor(*service);
+    const auto t0 = Clock::now() + std::chrono::hours(1);
+    auto at = [&](double s) {
+        return t0 + std::chrono::duration_cast<Clock::duration>(
+                        std::chrono::duration<double>(s));
+    };
+    const auto clients = NewClients(47);
+    const UUID rolled = clients.front();
+    for (int s = 0; s <= 11; ++s) {
+        for (const auto& id : clients) {
+            if (id != rolled || s <= 2) ObserveAt(*service, id, at(s));
+        }
+    }
+    EXPECT_EQ(SelectAt(*service, at(12.1)), std::vector<UUID>{rolled});
+
+    auto small = MakeService(/*ttl_sec=*/10);
+    StopClientMonitor(*small);
+    const auto pair = NewClients(2);
+    for (const auto& id : pair) ObserveAt(*small, id, t0);
+    EXPECT_EQ(SelectAt(*small, at(10.1)).size(), 2u);
+}
+
+// Every client silent at once is indistinguishable from a stall at first, but
+// the credit is capped (3 TTLs) and the hold is one more TTL: clients that are
+// really gone are expired within five TTLs.
+TEST_F(MasterLivenessIsolationTest, AllClientsSilentStillExpireEventually) {
+    auto service = MakeService(/*ttl_sec=*/10);
+    StopClientMonitor(*service);
+    const auto t0 = Clock::now() + std::chrono::hours(1);
+    auto at = [&](double s) {
+        return t0 + std::chrono::duration_cast<Clock::duration>(
+                        std::chrono::duration<double>(s));
+    };
+    const auto clients = NewClients(5);
+    for (const auto& id : clients) ObserveAt(*service, id, t0);
+    EXPECT_TRUE(SelectAt(*service, at(10.5)).empty());
+    EXPECT_TRUE(SelectAt(*service, at(39.5)).empty());  // Within the credit.
+    EXPECT_TRUE(SelectAt(*service, at(40.5)).empty());  // Due, held.
+    EXPECT_EQ(SelectAt(*service, at(50.6)).size(), clients.size());
+}
+
+// The incident's chain end to end, over RPC. One data RPC holds the server's
+// only IO thread for two TTLs (here behind a shard lock; on eu-west1 behind
+// the route rehash), and every Store's Ping queues behind it. The Master's own
+// silence must not expire them: once the call returns, their queued Pings are
+// answered and they are still OK. A client that stopped pinging before the
+// stall is expired at its TTL, and one that died during it, one TTL after.
+TEST_F(MasterLivenessIsolationTest, IoThreadStallDoesNotExpireEveryClient) {
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    config.client_live_ttl_sec = 3;
+    WrappedMasterService wrapped(config);
+    MasterService& service = ServiceOf(wrapped);
+    const int port = getFreeTcpPort();
+    coro_rpc::coro_rpc_server server(/*thread_num=*/1, port, "127.0.0.1",
+                                     std::chrono::seconds(0),
+                                     /*tcp_no_delay=*/true);
+    RegisterRpcService(server, wrapped);
+    ASSERT_FALSE(server.async_start().hasResult());
+    std::this_thread::sleep_for(milliseconds(200));  // Bound.
+    auto connect = [&] {
+        auto client = std::make_unique<coro_rpc::coro_rpc_client>();
+        EXPECT_FALSE(async_simple::coro::syncAwait(
+            client->connect("127.0.0.1", std::to_string(port))));
+        return client;
+    };
+
+    // Six Stores, each pinging over its own connection, synchronously and
+    // every 200 ms, as Client::StorageHeartbeatThreadMain does every second.
+    constexpr int kStores = 6;
+    std::vector<Client> stores;
+    for (int i = 0; i < kStores; ++i) {
+        stores.push_back(MountMemoryClient(service,
+                                           "stall_store_" + std::to_string(i),
+                                           0x100000000ULL * (i + 1), 64 << 20));
+    }
+    std::vector<std::unique_ptr<std::atomic<bool>>> pinging;
+    for (int i = 0; i < kStores; ++i) {
+        pinging.push_back(std::make_unique<std::atomic<bool>>(true));
+    }
+    std::atomic<bool> stop{false};
+    std::atomic<int> need_remount{0};
+    std::vector<std::thread> pingers;
+    for (int i = 0; i < kStores; ++i) {
+        pingers.emplace_back([&, i] {
+            auto rpc = connect();
+            while (!stop) {
+                if (*pinging[i]) {
+                    auto ping = async_simple::coro::syncAwait(
+                        rpc->call<&WrappedMasterService::Ping>(stores[i].id));
+                    if (ping && ping->has_value() &&
+                        (*ping)->client_status != ClientStatus::OK) {
+                        ++need_remount;
+                    }
+                }
+                std::this_thread::sleep_for(milliseconds(200));
+            }
+        });
+    }
+    const UUID stopped_before = stores[0].id;
+    const UUID died_during = stores[1].id;
+
+    // One client stops before the stall: it alone expires, at its TTL.
+    *pinging[0] = false;
+    EXPECT_TRUE(WaitFor([&] { return !IsOk(service, stopped_before); },
+                        milliseconds(6000)));
+    for (int i = 1; i < kStores; ++i) {
+        EXPECT_TRUE(IsOk(service, stores[i].id));
+    }
+
+    auto blocker = connect();
+    {
+        auto shard = LockShard(service, "stall_held_key");
+        auto call = std::async(std::launch::async, [&] {
+            return async_simple::coro::syncAwait(
+                       blocker->call<&WrappedMasterService::BatchExistKey>(
+                           std::vector<std::string>{"stall_held_key"},
+                           std::string(TenantId::kDefaultValue)))
+                .has_value();
+        });
+        std::this_thread::sleep_for(milliseconds(300));
+        *pinging[1] = false;  // Dies during the stall.
+        std::this_thread::sleep_for(milliseconds(5700));  // Two TTLs held.
+        ASSERT_EQ(call.wait_for(milliseconds(0)), std::future_status::timeout)
+            << "the call did not hold the IO thread";
+        shard.reset();
+        EXPECT_TRUE(call.get());
+    }
+    // The queued Pings are answered; the monitor ticks twice.
+    std::this_thread::sleep_for(milliseconds(2000));
+    for (int i = 2; i < kStores; ++i) {
+        EXPECT_TRUE(IsOk(service, stores[i].id))
+            << "store " << i << " expired by the Master's own stall";
+    }
+    EXPECT_EQ(need_remount.load(), 0);
+    // The one that died during the stall is still expired, one TTL after.
+    EXPECT_TRUE(WaitFor([&] { return !IsOk(service, died_during); },
+                        milliseconds(6000)));
+    stop = true;
+    for (auto& t : pingers) t.join();
+    server.stop();
 }
 
 }  // namespace mooncake::test
