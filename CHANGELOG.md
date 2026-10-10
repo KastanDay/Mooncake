@@ -6,6 +6,84 @@ python.cfdata.org. Newest first. Each entry is a GitLab release tagged
 `wheel-<version>` on the wheels' source commit; the version is the build's UTC
 start time, `YY.MDD.HMMSS`.
 
+## wheel-26.1010.50306 (2026-10-10)
+
+Master: wheel-26.1010.35017 plus kastan/Mooncake!6, the review follow-up to the routing-stall fix (!5).
+
+- **Mass-expiry hold from two clients due at once.** A partial stall, one RPC IO thread blocked past the TTL, leaves only the about 3 of 47 clients on that thread unanswered. The others keep pinging, so no observation stall is recorded. 26.1010.35017's threshold, max(3, clients/10), was 4 at 47 clients, so those 3 would expire. It now holds from 2 due at once, from 3 tracked clients. Two or more clients that really die together are expired one TTL later.
+- **The stall guard is reset on a failed restore** (HA/restore only).
+
+Same base (Mooncake 0.3.13.post1) and flags as 26.1010.35017 and 26.1009.173841.
+
+**Tests:**
+- `PartialStallOfAFewClientsIsHeldOneTtl` fails with the old threshold and passes now. `master_liveness_isolation_test` passes 37.
+- master_service (153), kv_churn (17), promotion_on_hit (56), master_admin_server (53), tenant_quota (32), master_service_tenant_quota (33), master_service_ssd (25), snapshot_child_process (25), segment (20), master_metrics (17), client_metrics (16), offload_on_evict (15), evict_scenario (13), service_scenario (12), tenant_quota_ledger (11), local_ssd (10), ssd_metrics (6), non_ha_reconnect (4), packing_scale (4), local_ssd_codec (3) and double_erase (1) pass.
+
+### Artifacts
+
+Version `26.1010.50306` (built 2026-10-10 05:03:06 UTC) from `ab3a2b951fbf4cf5ce938c6c078022b51a44b686` on `kastan/wheel`.
+Builder images: non-cuda: `pytorch/manylinux2_28-builder:cuda12.8`. CPython 3.12, x86_64.
+
+| Variant | File | sha256 | Registry |
+|---|---|---|---|
+| non-cuda | `mooncake_transfer_engine_non_cuda-26.1010.50306-cp312-cp312-manylinux_2_28_x86_64.whl` | `29c26cd0641e063856150c9b6b7891056db5396e1aa853d81ef07b308c6ffd41` | [https://python.cfdata.org/project/mooncake-transfer-engine-non-cuda/files/…](https://python.cfdata.org/project/mooncake-transfer-engine-non-cuda/files/mooncake_transfer_engine_non_cuda-26.1010.50306-cp312-cp312-manylinux_2_28_x86_64.whl) |
+
+Pin (mooncake-helm `mooncake-shared-cache` values; pods get `PYTHON_REGISTRY` from
+the `cf-python-registry` Secret):
+
+```yaml
+  master.package: "${PYTHON_REGISTRY}/project/mooncake-transfer-engine-non-cuda/files/mooncake_transfer_engine_non_cuda-26.1010.50306-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=29c26cd0641e063856150c9b6b7891056db5396e1aa853d81ef07b308c6ffd41"
+```
+
+### Commits since v0.3.13.post1
+
+- `431e70ef` [Store] Unregister a segment's memory when its mount fails (Kastan Day)
+- `57d1b314` Add additive successful-read source receipts to Store clients (Kastan Day)
+- `598eeac7` Distinguish observed replica eviction from surviving servable metadata (Kastan Day)
+- `1f4ce545` Record wheel-26.1006.215531 in the changelog (Kastan Day)
+- `5c120b67` [Store] Keep Master client liveness independent of metadata cleanup (Kastan Day)
+- `28edeb72` [Store] Close the gaps an implementation review found (Kastan Day)
+- `7d7cd076` [Store] Fence promotion enqueue and expiry's deadline cleanup (Kastan Day)
+- `ad44146a` Record wheel-26.1008.43949 in the changelog (Kastan Day)
+- `294ed5a4` [Store] Make disk-replica validity monotone; one record of client status (Kastan Day)
+- `8f86e3ea` [Store] Rebind only a completed disk replica on re-adoption (Kastan Day)
+- `5644d1f9` Record wheel-26.1008.65205 in the changelog (Kastan Day)
+- `7a5f072e` [Store] Bound inline quota eviction; no eviction pass holds the snapshot lock (Kastan Day)
+- `d208dfb3` Record wheel-26.1008.202747 in the changelog (Kastan Day)
+- `1e3e5fe1` [Store] Walk quota eviction from a random bucket; quiet routine trims (Kastan Day)
+- `317da539` [Store] Format the quota eviction walk (Kastan Day)
+- `1fc4dd95` Record wheel-26.1008.211229 in the changelog (Kastan Day)
+- `fe3310b8` [Store] Refuse writes to far-over tenants without scanning; quieter evictions (Kastan Day)
+- `b29e8e9c` [Store] Trim only what refused writes add; bound batches; no empty-census loop (Kastan Day)
+- `947d58f7` [Store] Bound inline quota eviction by time as well as keys (Kastan Day)
+- `90a89aca` [Store] Sum refused writes' demand for the quota trim (Kastan Day)
+- `fdbac9a7` [Store] Log slow RPCs and slow exclusive snapshot waits and holds (Kastan Day)
+- `d97c307e` [Store] Keep busy tenants' writes inline; refuse only collapsed quotas (Kastan Day)
+- `858be0a8` [Store] Cap the quota eviction's bucket visits separately from its keys (Kastan Day)
+- `647c8193` [Store] Export the allocators' footprint and largest free region (Kastan Day)
+- `2b3744bc` [Store] Count queued offloads as quota-eviction progress (Kastan Day)
+- `0cc0eae9` [Store] Scale tenant quota capacity by allocator packing, behind a flag (Kastan Day)
+- `d2730429` [Store] Keep the inline quota eviction to its deadline between shards (Kastan Day)
+- `205af36e` [Store] Format the last two quota-eviction changes (Kastan Day)
+- `f1c14eb5` [Store] Serve the Stores' batch RPCs off the RPC IO threads (Kastan Day)
+- `41d40227` [Store] Order the Stores' batch RPCs per connection, not per client (Kastan Day)
+- `a544e76e` Record wheel-v0.3.13.post1+26.1009.65649 in the changelog (Kastan Day)
+- `1c3f9734` [Store] Measure what Store churn costs the KV cache (Kastan Day)
+- `dbd268dd` [Store] Co-locate a batch put in its first object's chunk (Kastan Day)
+- `e9bbe868` [Doc] Design for keeping KV hit rates through Store churn (Kastan Day)
+- `10b303ef` Merge kastan/hot-replica-churn (kastan/Mooncake!3) into the wheel branch (Kastan Day)
+- `6ec05f69` Merge kastan/quota-packing-scale (kastan/Mooncake!1, !2) into the wheel branch (Kastan Day)
+- `9dadbe4b` Record wheel-v0.3.13.post1+26.1009.155842 in the changelog (Kastan Day)
+- `a45c87f6` [Store] Count rewrite-time churn drops; measure read load per Store (Kastan Day)
+- `99703cf7` [Doc] Caveats for reading the churn metrics (Kastan Day)
+- `fa83f4bf` Merge kastan/hot-replica-churn (kastan/Mooncake!4) into the wheel branch (Kastan Day)
+- `e5ffcfae` Record wheel-v0.3.13.post1+26.1009.173841 in the changelog (Kastan Day)
+- `8be977ef` [Store] Stripe group routing; don't count a Master stall against clients (Kastan Day)
+- `2b848529` Merge kastan/master-stall-mass-expiry into the wheel branch (Kastan Day)
+- `a7674ad0` Record wheel-26.1010.35017 in the changelog (Kastan Day)
+- `25a52b62` [Store] Hold two clients due at once; reset the stall guard on restore (Kastan Day)
+- `ab3a2b95` Merge kastan/master-stall-mass-expiry review fixes into the wheel branch (Kastan Day)
+
 ## wheel-26.1010.35017 (2026-10-10)
 
 Master: wheel-v0.3.13.post1+26.1009.173841 plus a fix for the 10.3-s routing stall that flushed eu-west1's DRAM tier at 01:34 UTC on 2026-10-10 (kastan/Mooncake!5). Same base (Mooncake 0.3.13.post1); named 26.1010.35017 because the `<base>+` naming isn't on mooncake-helm `main` yet.
