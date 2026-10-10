@@ -31,6 +31,7 @@
 #include "background_worker.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
+#include "group_routing_index.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
@@ -142,7 +143,9 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * 7. soft_pin_deadline_index_ mutex
  * liveness_mutex_ is a leaf: held only for a lookup or update of the
  * liveness table, never while waiting for any other lock, so Ping (which
- * takes nothing else) is answered whatever else is in progress. Nothing
+ * takes nothing else) is answered whatever else is in progress.
+ * group_routing_'s stripe locks are leaves too, taken by every metadata
+ * lookup (getMetadataShardIndex) and under shard locks. Nothing
  * holds client_mutex_ while it waits for snapshot_mutex_: a remount that
  * did, waiting behind a metadata sweep while every Ping waited on it, once
  * expired every client of a production Master at once.
@@ -1885,11 +1888,11 @@ class MasterService {
         const std::function<bool(const Replica&)>& pred_fn,
         std::vector<ReplicaID>* erased_replica_ids = nullptr);
 
-    std::unordered_map<std::string, std::string> object_group_ids_
-        GUARDED_BY(group_routing_mutex_);
-    mutable std::unordered_set<std::string> groups_needing_lease_refresh_
-        GUARDED_BY(group_routing_mutex_);
-    mutable std::shared_mutex group_routing_mutex_;
+    // Grouped objects' routes and the groups needing a lease refresh,
+    // striped so that no rehash or lookup waits on all of them (see
+    // GroupRoutingIndex). Its locks are leaves. Mutable: a read grants
+    // group leases and clears the group's refresh mark, as before.
+    mutable GroupRoutingIndex group_routing_;
 
     static constexpr size_t kObjectOperationLockStripes = 4096;
 
@@ -2636,11 +2639,55 @@ class MasterService {
     };
     // Records that the client was seen now; returns whether it is OK.
     bool ObserveClient(const UUID& client_id);
+    // ObserveClient at a given time (tests drive the clock).
+    bool ObserveClientAt(const UUID& client_id,
+                         std::chrono::steady_clock::time_point now);
     // Marks the client OK and seen now; returns whether it already was OK.
     bool MarkClientOk(const UUID& client_id);
     mutable std::mutex liveness_mutex_;
     std::unordered_map<UUID, ClientLiveness, boost::hash<UUID>>
         client_liveness_;
+
+    // A Master-side stall looks to the monitor like every client going
+    // silent at once. On eu-west1 (2026-10-10) a 10.3 s rehash held every
+    // metadata lookup, all 16 RPC IO threads blocked behind it, no Ping was
+    // answered, and all 47 clients expired at the 10-s TTL: a full flush.
+    // Two guards decide which overdue clients SelectClientsToExpire returns:
+    //  * Observation stalls. With at least kMinClientsForStallGuard clients
+    //    tracked, a gap of ObservationStallThreshold() or more in which no
+    //    client was observed at all is taken for the Master not answering,
+    //    not for every client dying at once. That time is not counted
+    //    against any client's TTL, up to MaxStallCredit() per client (after
+    //    which silent clients are taken as gone after all).
+    //  * Mass expiry. When MassExpiryThreshold() or more clients fall due at
+    //    once while others are still observed (some RPC threads stalled,
+    //    others not), none is expired until they have stayed due for one
+    //    more TTL. A single client (one Store rolled or crashed) still
+    //    expires at its TTL.
+    struct ObservationStall {
+        std::chrono::steady_clock::time_point start;
+        std::chrono::steady_clock::time_point end;
+    };
+    // Notes an observation at `now`; records the gap before it as a stall
+    // if it was one. liveness_mutex_ held.
+    void NoteObservationLocked(std::chrono::steady_clock::time_point now);
+    // The clients to expire at `now`, after both guards. Logs deferrals.
+    std::vector<UUID> SelectClientsToExpire(
+        std::chrono::steady_clock::time_point now);
+    std::chrono::milliseconds ObservationStallThreshold() const;
+    std::chrono::milliseconds MaxStallCredit() const;
+    static size_t MassExpiryThreshold(size_t tracked_clients);
+    static constexpr size_t kMinClientsForStallGuard = 3;
+    static constexpr size_t kMaxObservationStalls = 32;
+    // The latest observation of any client, and the recent stalls between
+    // observations (oldest first). Guarded by liveness_mutex_.
+    std::chrono::steady_clock::time_point last_observation_{};
+    std::deque<ObservationStall> observation_stalls_;
+    uint64_t observation_stalls_recorded_ = 0;
+    // Monitor bookkeeping, guarded by liveness_mutex_ too.
+    uint64_t observation_stalls_logged_ = 0;
+    std::optional<std::chrono::steady_clock::time_point>
+        mass_expiry_held_since_;
     const int64_t client_live_ttl_sec_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;

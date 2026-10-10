@@ -1371,12 +1371,8 @@ std::string MasterService::GetClientHostId(const UUID& client_id) const {
 
 size_t MasterService::getMetadataShardIndex(const TenantId& tenant_id,
                                             const std::string& key) const {
-    std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
-    auto it = object_group_ids_.find(tenant_id.MakeScopedKey(key));
-    if (it == object_group_ids_.end()) {
-        return getShardIndex(tenant_id, key);
-    }
-    return getShardIndex(it->second);
+    const auto group = group_routing_.FindRoute(tenant_id.MakeScopedKey(key));
+    return group ? getShardIndex(*group) : getShardIndex(tenant_id, key);
 }
 
 const TenantId& MasterService::ResolveRequestTenantId(
@@ -1809,12 +1805,7 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
 
 std::optional<std::string> MasterService::GetGroupRoute(
     const TenantId& tenant_id, const std::string& key) const {
-    std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
-    auto it = object_group_ids_.find(tenant_id.MakeScopedKey(key));
-    if (it == object_group_ids_.end()) {
-        return std::nullopt;
-    }
-    return it->second;
+    return group_routing_.FindRoute(tenant_id.MakeScopedKey(key));
 }
 
 MasterService::ObjectOperationLock MasterService::AcquireObjectOperationLock(
@@ -1832,9 +1823,8 @@ void MasterService::RegisterGroupMember(TenantState& tenant_state,
     if (group_id.empty()) {
         return;
     }
-    std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
-    object_group_ids_[tenant_id.MakeScopedKey(key)] = group_id;
-    groups_needing_lease_refresh_.insert(tenant_id.MakeScopedKey(group_id));
+    group_routing_.SetRoute(tenant_id.MakeScopedKey(key), group_id);
+    group_routing_.MarkNeedsRefresh(tenant_id.MakeScopedKey(group_id));
     tenant_state.group_members[group_id].insert(key);
 }
 
@@ -1854,13 +1844,9 @@ void MasterService::UnregisterGroupMember(TenantState& tenant_state,
             group_empty = true;
         }
     }
-    std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
-    auto route_it = object_group_ids_.find(tenant_id.MakeScopedKey(key));
-    if (route_it != object_group_ids_.end() && route_it->second == group_id) {
-        object_group_ids_.erase(route_it);
-    }
+    group_routing_.EraseRoute(tenant_id.MakeScopedKey(key), group_id);
     if (group_empty) {
-        groups_needing_lease_refresh_.erase(tenant_id.MakeScopedKey(group_id));
+        group_routing_.ClearNeedsRefresh(tenant_id.MakeScopedKey(group_id));
     }
 }
 
@@ -2436,11 +2422,7 @@ void MasterService::RebuildGroupRoutingIndex() {
             }
         }
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
-        object_group_ids_ = std::move(rebuilt_group_ids);
-        groups_needing_lease_refresh_ = std::move(groups_needing_refresh);
-    }
+    group_routing_.Reset(rebuilt_group_ids, groups_needing_refresh);
 }
 
 void MasterService::SoftPinDeadlineIndex::MaybeCompactLocked() {
@@ -2662,10 +2644,8 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
 
     bool needs_refresh = metadata.NeedsReadLeaseRefresh(default_kv_lease_ttl_);
     if (!needs_refresh) {
-        std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
-        needs_refresh =
-            groups_needing_lease_refresh_.find(metadata.tenant_id.MakeScopedKey(
-                metadata.group_id)) != groups_needing_lease_refresh_.end();
+        needs_refresh = group_routing_.NeedsRefresh(
+            metadata.tenant_id.MakeScopedKey(metadata.group_id));
     }
     if (!needs_refresh) {
         return;
@@ -2686,11 +2666,8 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
     if (group_it->second.find(key) == group_it->second.end()) {
         metadata.GrantReadLease(default_kv_lease_ttl_);
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
-        groups_needing_lease_refresh_.erase(
-            metadata.tenant_id.MakeScopedKey(metadata.group_id));
-    }
+    group_routing_.ClearNeedsRefresh(
+        metadata.tenant_id.MakeScopedKey(metadata.group_id));
 }
 
 void MasterService::ClearInvalidHandles(bool lock_snapshot_per_batch) {
@@ -3173,18 +3150,9 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     }
 
     std::vector<std::vector<size_t>> indices_by_shard(kNumShards);
-    {
-        std::shared_lock<std::shared_mutex> group_routing_lock(
-            group_routing_mutex_);
-        for (size_t i = 0; i < keys.size(); ++i) {
-            auto route_it = object_group_ids_.find(
-                normalized_tenant.MakeScopedKey(keys[i]));
-            const size_t shard_idx =
-                route_it == object_group_ids_.end()
-                    ? getShardIndex(normalized_tenant, keys[i])
-                    : getShardIndex(route_it->second);
-            indices_by_shard[shard_idx].push_back(i);
-        }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        indices_by_shard[getMetadataShardIndex(normalized_tenant, keys[i])]
+            .push_back(i);
     }
 
     // Churn metrics: why each missing key is missing. Keys whose metadata
@@ -4331,20 +4299,12 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     std::array<size_t, kNumShards> key_list_heads;
     key_list_heads.fill(kInvalidKeyIndex);
     std::vector<size_t> next_key_indexes(keys.size(), kInvalidKeyIndex);
-    {
-        std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
-        for (size_t i = keys.size(); i > 0; --i) {
-            const size_t original_idx = i - 1;
-            const auto scoped_key =
-                normalized_tenant.MakeScopedKey(keys[original_idx]);
-            const auto route_it = object_group_ids_.find(scoped_key);
-            const size_t shard_idx =
-                route_it == object_group_ids_.end()
-                    ? getShardIndex(normalized_tenant, keys[original_idx])
-                    : getShardIndex(route_it->second);
-            next_key_indexes[original_idx] = key_list_heads[shard_idx];
-            key_list_heads[shard_idx] = original_idx;
-        }
+    for (size_t i = keys.size(); i > 0; --i) {
+        const size_t original_idx = i - 1;
+        const size_t shard_idx =
+            getMetadataShardIndex(normalized_tenant, keys[original_idx]);
+        next_key_indexes[original_idx] = key_list_heads[shard_idx];
+        key_list_heads[shard_idx] = original_idx;
     }
 
     // Churn metrics: heat on every served key, the miss explanations (keys
@@ -4562,20 +4522,12 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     std::array<size_t, kNumShards> key_list_heads;
     key_list_heads.fill(kInvalidKeyIndex);
     std::vector<size_t> next_key_indexes(keys.size(), kInvalidKeyIndex);
-    {
-        std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
-        for (size_t i = keys.size(); i > 0; --i) {
-            const size_t original_idx = i - 1;
-            const auto scoped_key =
-                normalized_tenant.MakeScopedKey(keys[original_idx]);
-            const auto route_it = object_group_ids_.find(scoped_key);
-            const size_t shard_idx =
-                route_it == object_group_ids_.end()
-                    ? getShardIndex(normalized_tenant, keys[original_idx])
-                    : getShardIndex(route_it->second);
-            next_key_indexes[original_idx] = key_list_heads[shard_idx];
-            key_list_heads[shard_idx] = original_idx;
-        }
+    for (size_t i = keys.size(); i > 0; --i) {
+        const size_t original_idx = i - 1;
+        const size_t shard_idx =
+            getMetadataShardIndex(normalized_tenant, keys[original_idx]);
+        next_key_indexes[original_idx] = key_list_heads[shard_idx];
+        key_list_heads[shard_idx] = original_idx;
     }
 
     const size_t start_shard = randomIndex(kNumShards);
@@ -7879,17 +7831,58 @@ auto MasterService::Ping(const UUID& client_id)
 }
 
 bool MasterService::ObserveClient(const UUID& client_id) {
+    return ObserveClientAt(client_id, std::chrono::steady_clock::now());
+}
+
+bool MasterService::ObserveClientAt(const UUID& client_id,
+                                    std::chrono::steady_clock::time_point now) {
     std::lock_guard<std::mutex> lock(liveness_mutex_);
     auto& liveness = client_liveness_[client_id];
-    liveness.last_seen = std::chrono::steady_clock::now();
+    liveness.last_seen = std::max(liveness.last_seen, now);
+    NoteObservationLocked(now);
     return liveness.ok;
 }
 
 bool MasterService::MarkClientOk(const UUID& client_id) {
     std::lock_guard<std::mutex> lock(liveness_mutex_);
+    const auto now = std::chrono::steady_clock::now();
     auto& liveness = client_liveness_[client_id];
-    liveness.last_seen = std::chrono::steady_clock::now();
+    liveness.last_seen = std::max(liveness.last_seen, now);
+    NoteObservationLocked(now);
     return std::exchange(liveness.ok, true);
+}
+
+void MasterService::NoteObservationLocked(
+    std::chrono::steady_clock::time_point now) {
+    const auto epoch = std::chrono::steady_clock::time_point{};
+    if (last_observation_ != epoch && now > last_observation_ &&
+        now - last_observation_ >= ObservationStallThreshold() &&
+        client_liveness_.size() >= kMinClientsForStallGuard) {
+        observation_stalls_.push_back({last_observation_, now});
+        ++observation_stalls_recorded_;
+        if (observation_stalls_.size() > kMaxObservationStalls) {
+            observation_stalls_.pop_front();
+        }
+    }
+    last_observation_ = std::max(last_observation_, now);
+}
+
+std::chrono::milliseconds MasterService::ObservationStallThreshold() const {
+    // Clients ping every second: a third of the TTL, at most 3 s, with no
+    // client observed at all is the Master not answering. At least 200 ms,
+    // for tests' short TTLs.
+    const auto third_of_ttl =
+        std::chrono::milliseconds(client_live_ttl_sec_ * 1000 / 3);
+    return std::clamp(third_of_ttl, std::chrono::milliseconds(200),
+                      std::chrono::milliseconds(3000));
+}
+
+std::chrono::milliseconds MasterService::MaxStallCredit() const {
+    return std::chrono::milliseconds(3 * client_live_ttl_sec_ * 1000);
+}
+
+size_t MasterService::MassExpiryThreshold(size_t tracked_clients) {
+    return std::max<size_t>(3, tracked_clients / 10);
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
@@ -11898,19 +11891,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 void MasterService::ClientMonitorFunc() {
     while (client_monitor_running_) {
         const auto now = std::chrono::steady_clock::now();
-        const auto ttl = std::chrono::seconds(client_live_ttl_sec_);
-
-        // Only the leaf lock, briefly: Pings keep landing while expired
-        // clients are handled below.
-        std::vector<UUID> candidates;
-        {
-            std::lock_guard<std::mutex> lock(liveness_mutex_);
-            for (const auto& [client_id, liveness] : client_liveness_) {
-                if (liveness.last_seen + ttl <= now) {
-                    candidates.push_back(client_id);
-                }
-            }
-        }
+        const auto candidates = SelectClientsToExpire(now);
         if (!candidates.empty()) {
             ExpireClients(candidates, now);
         }
@@ -11918,6 +11899,128 @@ void MasterService::ClientMonitorFunc() {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kClientMonitorSleepMs));
     }
+}
+
+std::vector<UUID> MasterService::SelectClientsToExpire(
+    std::chrono::steady_clock::time_point now) {
+    using std::chrono::duration_cast;
+    using std::chrono::milliseconds;
+    const auto ttl = std::chrono::seconds(client_live_ttl_sec_);
+    const auto max_credit = MaxStallCredit();
+    const auto epoch = std::chrono::steady_clock::time_point{};
+
+    std::vector<UUID> due;
+    size_t tracked = 0;
+    size_t deferred_by_stall = 0;
+    std::vector<ObservationStall> new_stalls;
+    std::optional<ObservationStall> ongoing;
+    bool mass_hold_started = false;
+    bool mass_hold_released = false;
+    bool mass_held = false;
+    {
+        // Only the leaf lock, briefly: Pings keep landing while expired
+        // clients are handled by the caller.
+        std::lock_guard<std::mutex> lock(liveness_mutex_);
+        tracked = client_liveness_.size();
+        while (!observation_stalls_.empty() &&
+               observation_stalls_.front().end + ttl + max_credit < now) {
+            observation_stalls_.pop_front();
+        }
+        const uint64_t unlogged =
+            observation_stalls_recorded_ - observation_stalls_logged_;
+        for (size_t i = observation_stalls_.size() -
+                        std::min<size_t>(unlogged, observation_stalls_.size());
+             i < observation_stalls_.size(); ++i) {
+            new_stalls.push_back(observation_stalls_[i]);
+        }
+        observation_stalls_logged_ = observation_stalls_recorded_;
+        // No client observed for a while: a stall in progress.
+        if (tracked >= kMinClientsForStallGuard && last_observation_ != epoch &&
+            now > last_observation_ &&
+            now - last_observation_ >= ObservationStallThreshold()) {
+            ongoing = ObservationStall{last_observation_, now};
+        }
+
+        for (const auto& [client_id, liveness] : client_liveness_) {
+            if (liveness.last_seen + ttl > now) {
+                continue;
+            }
+            // The stalls between its last observation and now are the
+            // Master's silence, not the client's.
+            auto credit = std::chrono::steady_clock::duration::zero();
+            auto add_overlap = [&](const ObservationStall& stall) {
+                const auto from = std::max(stall.start, liveness.last_seen);
+                const auto to = std::min(stall.end, now);
+                if (to > from) {
+                    credit += to - from;
+                }
+            };
+            for (const auto& stall : observation_stalls_) {
+                add_overlap(stall);
+            }
+            if (ongoing) {
+                add_overlap(*ongoing);
+            }
+            credit = std::min<std::chrono::steady_clock::duration>(credit,
+                                                                   max_credit);
+            if (now - liveness.last_seen - credit >= ttl) {
+                due.push_back(client_id);
+            } else {
+                ++deferred_by_stall;
+            }
+        }
+
+        // Many clients due at once while others answer: likely RPC threads
+        // stalled behind one long call, not that many Stores. Hold them
+        // for one more TTL; a client that pings meanwhile is no longer due.
+        if (due.size() >= MassExpiryThreshold(tracked)) {
+            if (!mass_expiry_held_since_) {
+                mass_expiry_held_since_ = now;
+                mass_hold_started = true;
+            }
+            if (now - *mass_expiry_held_since_ < ttl) {
+                mass_held = true;
+            } else {
+                mass_hold_released = true;
+                mass_expiry_held_since_.reset();
+            }
+        } else {
+            mass_expiry_held_since_.reset();
+        }
+    }
+
+    for (const auto& stall : new_stalls) {
+        LOG(WARNING)
+            << "action=master_observation_stall, gap_ms="
+            << duration_cast<milliseconds>(stall.end - stall.start).count()
+            << ", tracked_clients=" << tracked
+            << ", info=no client was observed: its time does not "
+               "count against client TTLs";
+    }
+    if (deferred_by_stall > 0) {
+        LOG(WARNING) << "action=client_expiry_deferred, reason=master_stall"
+                     << ", clients=" << deferred_by_stall
+                     << ", tracked_clients=" << tracked << ", ongoing_stall_ms="
+                     << (ongoing ? duration_cast<milliseconds>(ongoing->end -
+                                                               ongoing->start)
+                                       .count()
+                                 : 0);
+    }
+    if (mass_hold_started) {
+        LOG(WARNING) << "action=client_expiry_deferred, reason=mass_expiry"
+                     << ", clients=" << due.size()
+                     << ", tracked_clients=" << tracked << ", hold_ms="
+                     << duration_cast<milliseconds>(ttl).count();
+    }
+    if (mass_held) {
+        return {};
+    }
+    if (mass_hold_released) {
+        LOG(WARNING) << "action=client_mass_expiry, clients=" << due.size()
+                     << ", tracked_clients=" << tracked
+                     << ", info=still silent after the hold";
+    }
+    return due;
 }
 
 void MasterService::ExpireClients(const std::vector<UUID>& candidates,
@@ -12508,12 +12611,7 @@ void MasterService::MetadataSerializer::Reset() {
     for (auto& shard : service_->metadata_shards_) {
         shard.tenants.clear();
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(
-            service_->group_routing_mutex_);
-        service_->object_group_ids_.clear();
-        service_->groups_needing_lease_refresh_.clear();
-    }
+    service_->group_routing_.Clear();
     {
         std::lock_guard lock(service_->discarded_replicas_mutex_);
         service_->discarded_replicas_.clear();
