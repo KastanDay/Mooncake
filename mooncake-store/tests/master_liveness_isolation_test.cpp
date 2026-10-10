@@ -1609,6 +1609,43 @@ TEST_F(MasterLivenessIsolationTest, ManyClientsDueAtOnceAreHeldOneTtl) {
     EXPECT_EQ(expired, expected);
 }
 
+// A partial stall: one blocked RPC IO thread serves only a few connections
+// (about 3 of 47 over 16 threads on eu-west1), so the other clients keep
+// pinging and no observation stall is recorded. Those few are held one TTL,
+// which the old threshold (max(3, n/10), 4 at 47) did not do.
+TEST_F(MasterLivenessIsolationTest, PartialStallOfAFewClientsIsHeldOneTtl) {
+    const auto t0 = Clock::now() + std::chrono::hours(1);
+    auto at = [&](double s) {
+        return t0 + std::chrono::duration_cast<Clock::duration>(
+                        std::chrono::duration<double>(s));
+    };
+    const auto clients = NewClients(47);
+    for (size_t stuck_count : {size_t{2}, size_t{3}}) {
+        auto svc = MakeService(/*ttl_sec=*/10);
+        StopClientMonitor(*svc);
+        const std::vector<UUID> stuck(clients.begin(),
+                                      clients.begin() + stuck_count);
+        auto is_stuck = [&](const UUID& id) {
+            return std::find(stuck.begin(), stuck.end(), id) != stuck.end();
+        };
+        for (int s = 0; s <= 2; ++s) {
+            for (const auto& id : clients) ObserveAt(*svc, id, at(s));
+        }
+        // The thread is blocked from 2 s to 16 s: due from 12 s, held.
+        for (int s = 3; s <= 15; ++s) {
+            for (const auto& id : clients) {
+                if (!is_stuck(id)) ObserveAt(*svc, id, at(s));
+            }
+            EXPECT_TRUE(SelectAt(*svc, at(s + 0.5)).empty())
+                << stuck_count << " stuck, " << s;
+        }
+        // Their queued Pings are answered: they stay.
+        for (const auto& id : stuck) ObserveAt(*svc, id, at(16));
+        for (const auto& id : clients) ObserveAt(*svc, id, at(16.5));
+        EXPECT_TRUE(SelectAt(*svc, at(17)).empty()) << stuck_count;
+    }
+}
+
 // The steady state is unchanged: one silent client (a Store rolled or
 // crashed) expires at its TTL, and so do the clients of a small Master.
 TEST_F(MasterLivenessIsolationTest, OneSilentClientStillExpiresAtTtl) {
