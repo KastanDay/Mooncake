@@ -2660,9 +2660,12 @@ class MasterService {
     //    against any client's TTL, up to MaxStallCredit() per client (after
     //    which silent clients are taken as gone after all).
     //  * Mass expiry. When MassExpiryThreshold() or more clients fall due at
-    //    once while others are still observed (some RPC threads stalled,
-    //    others not), none is expired until they have stayed due for one
-    //    more TTL. A single client (one Store rolled or crashed) still
+    //    once, none is expired until they have stayed due for one more TTL.
+    //    This covers a partial stall, which the observation guard cannot see
+    //    because other clients are still observed: one blocked RPC IO thread
+    //    leaves only the clients whose connections it serves unanswered (about
+    //    3 of 47 over 16 threads on eu-west1). It applies too when every
+    //    client is due. A single client (one Store rolled or crashed) still
     //    expires at its TTL.
     struct ObservationStall {
         std::chrono::steady_clock::time_point start;

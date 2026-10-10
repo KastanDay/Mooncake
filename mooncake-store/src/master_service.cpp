@@ -7882,7 +7882,15 @@ std::chrono::milliseconds MasterService::MaxStallCredit() const {
 }
 
 size_t MasterService::MassExpiryThreshold(size_t tracked_clients) {
-    return std::max<size_t>(3, tracked_clients / 10);
+    // Two, not a share of the clients: one blocked IO thread starves only the
+    // few connections it serves, and a share (once max(3, n/10), 4 at 47
+    // clients) let exactly those expire. Two or more clients that really die
+    // together are expired one TTL later. Below kMinClientsForStallGuard, as
+    // for the stall credit, there is no hold.
+    if (tracked_clients < kMinClientsForStallGuard) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return 2;
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
@@ -10316,6 +10324,11 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
     {
         std::lock_guard<std::mutex> lock(liveness_mutex_);
         client_liveness_.clear();
+        last_observation_ = {};
+        observation_stalls_.clear();
+        observation_stalls_recorded_ = 0;
+        observation_stalls_logged_ = 0;
+        mass_expiry_held_since_.reset();
     }
 
     MasterMetricManager::instance().reset_allocated_mem_size();
